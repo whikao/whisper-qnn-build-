@@ -227,8 +227,10 @@ jobs:
       - name: 真实语音校准 + 提交云端量化任务 (耗时步骤)
         env:
           QAI_DEVICE: ${{ inputs.device }}
-          ENC_CALIB: "150"   # encoder 校准样本数 (真实 mel)
-          DEC_CALIB: "64"    # decoder 校准样本数 (合成数据, 很便宜)
+          ENC_CALIB: "150"   # encoder 校准样本数 (真实 mel, ~230MB)
+          # decoder 校准样本数: 每个样本 kv cache 约 126MB (32层 self + 4层 cross),
+          # 64 个就要 8GB 必 OOM! 合成数据 6 个对 min-max 校准足够
+          DEC_CALIB: "6"
         run: |
           cat > /tmp/hub_submit_quantize.py <<'PYEOF'
           import json
@@ -280,6 +282,8 @@ jobs:
                   print(f"[calib] {component_name}: 真实语音 mel x{len(mels)}")
                   return make_hub_dataset_entries((mels,), ["input_features"])
               # decoder: 形状/类型与 input_spec 精确对齐的合成校准数据
+              import gc
+              gc.collect()  # encoder 校准上传完, 先回收一轮再生成 decoder 数据
               print(f"[calib] {component_name}: 合成校准 x{DEC_N} (input_spec 对齐)")
               names = list(spec.keys())
               data = {n: [] for n in names}
