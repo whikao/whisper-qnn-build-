@@ -87,14 +87,17 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: 安装依赖 (CPU 版 torch, 避免下载 2GB+ CUDA 包)
+      - name: 安装依赖 (CPU 版 torch/torchvision, 避免下载 2GB+ CUDA 包; 钉死版本防漂移)
         run: |
           python -m pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install qai-hub qai-hub-models "transformers==4.56.2"
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install "qai-hub-models==0.58.0" "transformers==4.56.2"
           # 新版 whisper 配方的 __init__ 会连带 import 演示 app (依赖 sounddevice)
           sudo apt-get update -qq && sudo apt-get install -y -qq libportaudio2
           pip install sounddevice
+          # 诊断: 确认实际安装版本 (脚本是按 0.58.0 源码核对的)
+          python -c "from importlib.metadata import version; print('qai-hub-models', version('qai-hub-models'), '| qai-hub', version('qai-hub'))"
+          python -c "from qai_hub_models.utils.export.dispatch import resolve_export_model; print('export.dispatch OK')"
 
       - name: 安装 w8a16 额外依赖 (真实语音校准数据生成用)
         if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
