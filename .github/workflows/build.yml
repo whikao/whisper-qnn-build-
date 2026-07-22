@@ -94,6 +94,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install qai-hub qai-hub-models "transformers==4.56.2"
+          # 新版 whisper 配方的 __init__ 会连带 import 演示 app (依赖 sounddevice)
+          sudo apt-get update -qq && sudo apt-get install -y -qq libportaudio2
+          pip install sounddevice
 
       - name: 安装 w8a16 额外依赖 (校准数据生成用, 不装 AIMET)
         if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
