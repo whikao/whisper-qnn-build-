@@ -25,17 +25,20 @@
 #   tokens.txt 继续用 sherpa-onnx whisper-medium 那份 (v2/v3 文本 token 一致)
 #
 # 预期: float 路径全程约 30~90 分钟, 产物 ~3.1GB fp16;
-#       w8a16 路径多了"真实语音校准数据生成"步骤 (runner 上跑十几次 encoder
-#       推理), 全程约 2~4 小时, 产物 ~1.55GB
+#       w8a16 路径分两个 job 共约 1~2 小时, 产物 ~1.55GB
 #
-# w8a16 量化版 (precision 选 w8a16) —— 全云端量化, runner 不跑 AIMET:
-#   直接调用官方集合导出管线 (绕过 CLI 白名单), 流程全部在高通服务器:
-#   上传 TorchScript -> 云端转 ONNX -> 云端量化 (w8a16 = INT8 权重 +
-#   INT16 激活) -> 云端编译 EPContext。runner 内存占用 < 2GB, 无 OOM 风险。
+# w8a16 量化版 (precision 选 w8a16) —— 全云端量化, 两阶段断点续传:
+#   Job A (submit_quantize, ~20-30 分钟): 注册变体 -> 生成真实 LibriSpeech
+#     mel 校准数据 -> 调官方管线 (skip_compiling=True) 上传 TorchScript ->
+#     云端转 ONNX -> 提交云端量化任务 (w8a16 = INT8 权重 + INT16 激活),
+#     把量化任务 ID 存为 artifact 后结束。runner 短寿, 不怕平台回收。
+#   Job B (build_quantize, 新 runner): 按任务 ID 轮询量化结果 (结果存在
+#     高通服务器, runner 死了也不丢), 再把量化模型 ID 喂回官方管线
+#     (quantized_model_id 参数) 直接编译 EPContext -> 下载打包。
+#     若 Job B 被平台回收, 直接 Re-run 该 job 即可, 量化不会重做。
 #   校准数据: 猴子补丁官方校准函数, encoder 用真实 LibriSpeech 语音
 #   算出的 log-mel (150 条), decoder 用与 input_spec 精确对齐的合成数据。
-#   注意: qai_hub 的 Python API 偶尔改版, 若脚本报属性/参数名错误, 把日志
-#         发我, 一般改一行就能适配。
+#   注意: 脚本按 qai_hub_models 0.58.0 源码核对, 已钉死版本。
 # ============================================================================
 
 name: Convert Whisper to QNN EPContext
@@ -73,7 +76,11 @@ permissions:
   contents: read
 
 jobs:
+  # ==========================================================================
+  # float 路径 (+ list_devices 辅助模式): 单 job 一把出 EPContext
+  # ==========================================================================
   convert:
+    if: ${{ inputs.precision == 'float' || inputs.list_devices }}
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -98,19 +105,6 @@ jobs:
           # 诊断: 确认实际安装版本 (脚本是按 0.58.0 源码核对的)
           python -c "from importlib.metadata import version; print('qai-hub-models', version('qai-hub-models'), '| qai-hub', version('qai-hub'))"
           python -c "from qai_hub_models.utils.export.dispatch import resolve_export_model; print('export.dispatch OK')"
-
-      - name: 安装 w8a16 额外依赖 (真实语音校准数据生成用)
-        if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
-        run: |
-          pip install soundfile
-
-      - name: 检查 w8a16 支持的模型
-        if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
-        run: |
-          if [ "${{ inputs.model_id }}" != "whisper_large_v3" ]; then
-            echo "::error::w8a16 云端量化路径目前只写了 whisper_large_v3 (自注册); 其他型号请用 float 精度"
-            exit 1
-          fi
 
       - name: 配置 AI Hub API token
         run: |
@@ -145,27 +139,99 @@ jobs:
           ! grep -rn "Turbo\|turbo" *.py | grep -v README || true
           python -c "import importlib; m = importlib.import_module('qai_hub_models.models.whisper_large_v3'); print('注册成功:', m.Model)"
 
-      # ================= float 路径: 一条命令出 EPContext =================
       - name: 导出 ONNX + AI Hub 云编译为 EPContext (float 路径)
-        if: ${{ !inputs.list_devices && inputs.precision == 'float' }}
+        if: ${{ !inputs.list_devices }}
         run: |
           python -m "qai_hub_models.models.${{ inputs.model_id }}.export" \
             --target-runtime precompiled_qnn_onnx \
             --device "${{ inputs.device }}"
 
-      # ================= w8a16 路径: 全云端量化 =================
-      # 直接调官方集合导出管线 (绕过 CLI 的 runtime 白名单):
-      #   上传 TorchScript -> 云端转 ONNX -> 云端量化 -> 云端编译 EPContext
-      # 并猴子补丁校准数据函数: encoder 校准用真实 LibriSpeech mel,
-      # decoder 校准用与 input_spec 精确对齐的合成数据。
-      - name: 真实语音校准 + 云端量化 + 云端编译 (w8a16, 耗时步骤)
-        if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
+      - name: 打包产物 (按 1.8GB 分卷, 绕过单 artifact 2GB 限制)
+        if: ${{ !inputs.list_devices }}
+        run: |
+          find export_assets -maxdepth 3 -type f | head -50
+          cd export_assets
+          zip -0 -r -s 1800m "../${{ inputs.model_id }}_precompiled_qnn_onnx.zip" .
+          cd ..
+          ls -la *.zip*
+
+      - name: 上传编译产物
+        if: ${{ !inputs.list_devices }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.model_id }}-precompiled-qnn-onnx
+          path: ${{ inputs.model_id }}*_precompiled_qnn_onnx.zip*
+          compression-level: 0
+          retention-days: 7
+
+  # ==========================================================================
+  # w8a16 阶段 A: 真实语音校准 + 提交云端量化任务 (短寿 job, ~20-30 分钟)
+  # ==========================================================================
+  submit_quantize:
+    if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: 清理磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/lib/jvm || true
+          docker system prune -af 2>/dev/null || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install "qai-hub-models==0.58.0" "transformers==4.56.2"
+          sudo apt-get update -qq && sudo apt-get install -y -qq libportaudio2
+          pip install sounddevice soundfile
+          python -c "from importlib.metadata import version; print('qai-hub-models', version('qai-hub-models'), '| qai-hub', version('qai-hub'))"
+          python -c "from qai_hub_models.utils.export.dispatch import resolve_export_model; print('export.dispatch OK')"
+
+      - name: 检查 w8a16 支持的模型
+        run: |
+          if [ "${{ inputs.model_id }}" != "whisper_large_v3" ]; then
+            echo "::error::w8a16 云端量化路径目前只写了 whisper_large_v3 (自注册); 其他型号请用 float 精度"
+            exit 1
+          fi
+
+      - name: 配置 AI Hub API token
+        run: |
+          qai-hub configure --api_token "${{ secrets.QAI_HUB_API_TOKEN }}" || {
+            mkdir -p ~/.qai_hub
+            printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
+          }
+
+      - name: 注册 whisper_large_v3 变体
+        run: |
+          set -e
+          MODELS_DIR=$(python -c "import pathlib, qai_hub_models; print(pathlib.Path(qai_hub_models.__file__).parent / 'models')")
+          echo "qai_hub_models 模型目录: $MODELS_DIR"
+          cp -r "$MODELS_DIR/whisper_large_v3_turbo" "$MODELS_DIR/whisper_large_v3"
+          cd "$MODELS_DIR/whisper_large_v3"
+          sed -i 's|openai/whisper-large-v3-turbo|openai/whisper-large-v3|g' model.py
+          sed -i 's|WhisperLargeV3Turbo|WhisperLargeV3|g' *.py
+          sed -i 's|whisper_large_v3_turbo|whisper_large_v3|g' *.py info.yaml
+          sed -i 's|whisper-large-v3-turbo|whisper-large-v3|g' *.py info.yaml
+          sed -i 's|Whisper Large V3 Turbo|Whisper Large V3|g' model.py info.yaml
+          sed -i 's|Whisper-Large-V3-Turbo|Whisper-Large-V3|g' info.yaml
+          sed -i 's|^status: published|status: unpublished|' info.yaml
+          echo 'status_reason: "CI-registered custom variant, not an official release."' >> info.yaml
+          grep -n 'WHISPER_VERSION' model.py
+          python -c "import importlib; m = importlib.import_module('qai_hub_models.models.whisper_large_v3'); print('注册成功:', m.Model)"
+
+      - name: 真实语音校准 + 提交云端量化任务 (耗时步骤)
         env:
           QAI_DEVICE: ${{ inputs.device }}
           ENC_CALIB: "150"   # encoder 校准样本数 (真实 mel)
           DEC_CALIB: "64"    # decoder 校准样本数 (合成数据, 很便宜)
         run: |
-          cat > /tmp/hub_quantize_export.py <<'PYEOF'
+          cat > /tmp/hub_submit_quantize.py <<'PYEOF'
+          import json
           import os
           import numpy as np
           import qai_hub as hub
@@ -234,7 +300,149 @@ jobs:
 
           quantization_utils.get_calibration_data = patched
 
-          # ---------- 3. 调官方管线: 量化+编译全部在 AI Hub 云端完成 ----------
+          # ---------- 3. 官方管线跑到"提交量化任务"为止 ----------
+          export_model = resolve_export_model(MODEL_ID)
+          device = hub.Device(name=DEVICE, attributes=[], os="")
+          result = export_model(
+              MODEL_ID,
+              device=device,
+              precision=Precision.w8a16,
+              target_runtime=TargetRuntime.PRECOMPILED_QNN_ONNX,
+              skip_compiling=True,      # 提交完量化任务就返回
+              skip_profiling=True,
+              skip_inferencing=True,
+              output_dir="export_assets",
+          )
+          assert result.quantize_jobs, "量化任务未提交"
+          ids = {}
+          for name, job in result.quantize_jobs.items():
+              jid = getattr(job, "job_id", None) or getattr(job, "id", None)
+              assert jid, f"{name} 任务 ID 获取失败"
+              ids[name] = jid
+          with open("quantize_jobs.json", "w") as f:
+              json.dump(ids, f, indent=2)
+          print("量化任务已提交, ID:", ids)
+          PYEOF
+          python /tmp/hub_submit_quantize.py
+          cat quantize_jobs.json
+
+      - name: 保存量化任务 ID (断点)
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantize-jobs-json
+          path: quantize_jobs.json
+          retention-days: 1
+
+  # ==========================================================================
+  # w8a16 阶段 B: 轮询量化结果 -> 云端编译 EPContext -> 打包 (新 runner)
+  # 被杀就直接 Re-run 这个 job, 量化结果在高通服务器上不会丢
+  # ==========================================================================
+  build_quantize:
+    needs: submit_quantize
+    if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: 清理磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/lib/jvm || true
+          docker system prune -af 2>/dev/null || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install "qai-hub-models==0.58.0" "transformers==4.56.2"
+          sudo apt-get update -qq && sudo apt-get install -y -qq libportaudio2
+          pip install sounddevice
+          python -c "from qai_hub_models.utils.export.dispatch import resolve_export_model; print('export.dispatch OK')"
+
+      - name: 配置 AI Hub API token
+        run: |
+          qai-hub configure --api_token "${{ secrets.QAI_HUB_API_TOKEN }}" || {
+            mkdir -p ~/.qai_hub
+            printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
+          }
+
+      - name: 读取量化任务 ID (断点恢复)
+        uses: actions/download-artifact@v4
+        with:
+          name: quantize-jobs-json
+
+      - name: 注册 whisper_large_v3 变体
+        run: |
+          set -e
+          MODELS_DIR=$(python -c "import pathlib, qai_hub_models; print(pathlib.Path(qai_hub_models.__file__).parent / 'models')")
+          cp -r "$MODELS_DIR/whisper_large_v3_turbo" "$MODELS_DIR/whisper_large_v3"
+          cd "$MODELS_DIR/whisper_large_v3"
+          sed -i 's|openai/whisper-large-v3-turbo|openai/whisper-large-v3|g' model.py
+          sed -i 's|WhisperLargeV3Turbo|WhisperLargeV3|g' *.py
+          sed -i 's|whisper_large_v3_turbo|whisper_large_v3|g' *.py info.yaml
+          sed -i 's|whisper-large-v3-turbo|whisper-large-v3|g' *.py info.yaml
+          sed -i 's|Whisper Large V3 Turbo|Whisper Large V3|g' model.py info.yaml
+          sed -i 's|Whisper-Large-V3-Turbo|Whisper-Large-V3|g' info.yaml
+          sed -i 's|^status: published|status: unpublished|' info.yaml
+          echo 'status_reason: "CI-registered custom variant, not an official release."' >> info.yaml
+          python -c "import importlib; m = importlib.import_module('qai_hub_models.models.whisper_large_v3'); print('注册成功:', m.Model)"
+
+      - name: 轮询量化结果 + 云端编译 EPContext + 下载 (耗时步骤)
+        env:
+          QAI_DEVICE: ${{ inputs.device }}
+        run: |
+          cat > /tmp/hub_build_from_quantize.py <<'PYEOF'
+          import json
+          import os
+          import time
+          import qai_hub as hub
+          from qai_hub_models import Precision, TargetRuntime
+          from qai_hub_models.utils.export.dispatch import resolve_export_model
+
+          DEVICE = os.environ["QAI_DEVICE"]
+          MODEL_ID = "whisper_large_v3"
+
+          def wait_job(job, tag):
+              """等待任务完成; 兼容不同版本客户端的等待 API"""
+              if hasattr(job, "wait"):
+                  try:
+                      job.wait()
+                      return
+                  except TypeError:
+                      pass
+              for i in range(240):  # 最多 4 小时
+                  st = ""
+                  try:
+                      st = str(job.get_status())
+                  except Exception:
+                      st = str(getattr(job, "status", ""))
+                  print(f"[{tag}] {i}min: {st}")
+                  up = st.upper()
+                  if "SUCCESS" in up:
+                      return
+                  if "FAIL" in up or "ERROR" in up:
+                      raise RuntimeError(f"{tag} 失败: {st}")
+                  time.sleep(60)
+              raise TimeoutError(f"{tag} 等待超时")
+
+          # ---------- 1. 按任务 ID 轮询量化结果 ----------
+          ids = json.load(open("quantize_jobs.json"))
+          print("断点恢复, 量化任务:", ids)
+          qmodels = {}
+          for name, jid in ids.items():
+              job = hub.get_job(jid)
+              wait_job(job, f"quantize/{name}")
+              m = job.get_target_model()
+              assert m is not None, f"{name} 量化未产出模型"
+              mid = getattr(m, "model_id", None) or getattr(m, "id", None)
+              assert mid, f"{name} 模型 ID 获取失败"
+              qmodels[name] = mid
+              print(f"{name} 量化完成 -> {mid}")
+
+          # ---------- 2. 量化模型 ID 喂回官方管线, 直接编译 EPContext ----------
           export_model = resolve_export_model(MODEL_ID)
           device = hub.Device(name=DEVICE, attributes=[], os="")
           export_model(
@@ -242,31 +450,28 @@ jobs:
               device=device,
               precision=Precision.w8a16,
               target_runtime=TargetRuntime.PRECOMPILED_QNN_ONNX,
+              quantized_model_id=qmodels,   # 跳过量化, 直接编译
               skip_profiling=True,
               skip_inferencing=True,
               output_dir="export_assets",
           )
-          print("w8a16 云端量化+编译完成")
+          print("w8a16 云端编译+下载完成")
           PYEOF
-          python /tmp/hub_quantize_export.py
+          python /tmp/hub_build_from_quantize.py
           find export_assets -maxdepth 3 -type f | head -30
 
       - name: 打包产物 (按 1.8GB 分卷, 绕过单 artifact 2GB 限制)
-        if: ${{ !inputs.list_devices }}
         run: |
           find export_assets -maxdepth 3 -type f | head -50
-          SUFFIX=""
-          if [ "${{ inputs.precision }}" = "w8a16" ]; then SUFFIX="_quantized"; fi
           cd export_assets
-          zip -0 -r -s 1800m "../${{ inputs.model_id }}${SUFFIX}_precompiled_qnn_onnx.zip" .
+          zip -0 -r -s 1800m "../${{ inputs.model_id }}_quantized_precompiled_qnn_onnx.zip" .
           cd ..
           ls -la *.zip*
 
       - name: 上传编译产物
-        if: ${{ !inputs.list_devices }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.model_id }}${{ inputs.precision == 'w8a16' && '-quantized' || '' }}-precompiled-qnn-onnx
+          name: ${{ inputs.model_id }}-quantized-precompiled-qnn-onnx
           path: ${{ inputs.model_id }}*_precompiled_qnn_onnx.zip*
           compression-level: 0
           retention-days: 7
