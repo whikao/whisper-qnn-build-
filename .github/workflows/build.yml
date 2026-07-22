@@ -137,6 +137,10 @@ jobs:
           sed -i 's|whisper-large-v3-turbo|whisper-large-v3|g' *.py info.yaml
           sed -i 's|Whisper Large V3 Turbo|Whisper Large V3|g' model.py info.yaml
           sed -i 's|Whisper-Large-V3-Turbo|Whisper-Large-V3|g' info.yaml
+          # info.yaml 校验: published 状态必须有官方 release-assets.yaml, 自注册
+          # 变体没有, 改为 unpublished (校验器仅要求 status_reason 非空)
+          sed -i 's|^status: published|status: unpublished|' info.yaml
+          echo 'status_reason: "CI-registered custom variant, not an official release."' >> info.yaml
           grep -n 'WHISPER_VERSION' model.py
           ! grep -rn "Turbo\|turbo" *.py | grep -v README || true
           python -c "import importlib; m = importlib.import_module('qai_hub_models.models.whisper_large_v3'); print('注册成功:', m.Model)"
