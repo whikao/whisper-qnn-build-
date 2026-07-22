@@ -135,7 +135,7 @@ jobs:
           sed -i 's|Whisper-Large-V3-Turbo|Whisper-Large-V3|g' info.yaml
           grep -n 'WHISPER_VERSION' model.py
           ! grep -rn "Turbo\|turbo" *.py | grep -v README || true
-          python -c "from qai_hub_models.utils.export.context import resolve_model_cls; print('注册成功:', resolve_model_cls('whisper_large_v3'))"
+          python -c "import importlib; m = importlib.import_module('qai_hub_models.models.whisper_large_v3'); print('注册成功:', m.Model)"
 
       # ================= float 路径: 一条命令出 EPContext =================
       - name: 导出 ONNX + AI Hub 云编译为 EPContext (float 路径)
