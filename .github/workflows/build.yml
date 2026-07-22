@@ -29,14 +29,12 @@
 #       推理), 全程约 2~4 小时, 产物 ~1.55GB
 #
 # w8a16 量化版 (precision 选 w8a16) —— 全云端量化, runner 不跑 AIMET:
-#   1) runner 只导出 float ONNX (encoder + decoder)
-#   2) runner 下载 LibriSpeech 真实语音 -> 算 log-mel -> 构造校准数据
-#      (encoder 用真实 mel; decoder 用真实 encoder 输出 + 模拟解码步输入)
-#   3) submit_quantize_job 把量化和 AIMET 计算都交给高通服务器 (w8a16 =
-#      INT8 权重 + INT16 激活), runner 内存占用 < 2GB, 无 OOM 风险
-#   4) submit_compile_job 把量化后 QDQ onnx 编成 EPContext
-#   注意: 量化用的校准数据是真实语音特征, 不是随机/占位样本, 质量有保障。
-#         qai_hub 的 Python API 偶尔改版, 若脚本报属性/参数名错误, 把日志
+#   直接调用官方集合导出管线 (绕过 CLI 白名单), 流程全部在高通服务器:
+#   上传 TorchScript -> 云端转 ONNX -> 云端量化 (w8a16 = INT8 权重 +
+#   INT16 激活) -> 云端编译 EPContext。runner 内存占用 < 2GB, 无 OOM 风险。
+#   校准数据: 猴子补丁官方校准函数, encoder 用真实 LibriSpeech 语音
+#   算出的 log-mel (150 条), decoder 用与 input_spec 精确对齐的合成数据。
+#   注意: qai_hub 的 Python API 偶尔改版, 若脚本报属性/参数名错误, 把日志
 #         发我, 一般改一行就能适配。
 # ============================================================================
 
@@ -98,10 +96,10 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq libportaudio2
           pip install sounddevice
 
-      - name: 安装 w8a16 额外依赖 (校准数据生成用, 不装 AIMET)
+      - name: 安装 w8a16 额外依赖 (真实语音校准数据生成用)
         if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
         run: |
-          pip install onnxruntime datasets soundfile
+          pip install datasets soundfile librosa
 
       - name: 检查 w8a16 支持的模型
         if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
@@ -149,46 +147,32 @@ jobs:
             --device "${{ inputs.device }}"
 
       # ================= w8a16 路径: 全云端量化 =================
-      - name: 导出 float ONNX (w8a16 第 1 步, 只导出不编译)
-        if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
-        run: |
-          python -m "qai_hub_models.models.${{ inputs.model_id }}.export" \
-            --target-runtime onnx \
-            --device "${{ inputs.device }}"
-          find export_assets -name "*.onnx" | head
-
-      - name: 真实语音校准 + 云端量化 + 云端编译 (w8a16 第 2 步, 耗时)
+      # 直接调官方集合导出管线 (绕过 CLI 的 runtime 白名单):
+      #   上传 TorchScript -> 云端转 ONNX -> 云端量化 -> 云端编译 EPContext
+      # 并猴子补丁校准数据函数: encoder 校准用真实 LibriSpeech mel,
+      # decoder 校准用与 input_spec 精确对齐的合成数据。
+      - name: 真实语音校准 + 云端量化 + 云端编译 (w8a16, 耗时步骤)
         if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
         env:
           QAI_DEVICE: ${{ inputs.device }}
           ENC_CALIB: "150"   # encoder 校准样本数 (真实 mel)
-          DEC_CALIB: "12"    # decoder 校准样本数 (要跑 encoder 推理, 别贪多)
+          DEC_CALIB: "64"    # decoder 校准样本数 (合成数据, 很便宜)
         run: |
-          cat > /tmp/hub_quantize_compile.py <<'PYEOF'
-          import glob, os, sys
+          cat > /tmp/hub_quantize_export.py <<'PYEOF'
+          import os
           import numpy as np
-          import onnxruntime as ort
           import qai_hub as hub
+          from qai_hub_models import Precision, TargetRuntime
+          from qai_hub_models.utils import quantization as quantization_utils
+          from qai_hub_models.utils.export.dispatch import resolve_export_model
+          from qai_hub_models.utils.qai_hub_helpers import make_hub_dataset_entries
 
           DEVICE = os.environ["QAI_DEVICE"]
+          MODEL_ID = "whisper_large_v3"
           ENC_N = int(os.environ.get("ENC_CALIB", "150"))
-          DEC_N = int(os.environ.get("DEC_CALIB", "12"))
-          PAST = 8          # decoder 校准时的模拟 past 长度
-          TQ = 3            # 每次喂给 decoder 的 token 数 (与 3-token prompt 对齐)
+          DEC_N = int(os.environ.get("DEC_CALIB", "64"))
 
-          # ---------- 1. 定位导出的 encoder / decoder onnx ----------
-          enc_path = dec_path = None
-          for p in sorted(glob.glob("export_assets/**/*.onnx", recursive=True)):
-              names = [i.name for i in ort.InferenceSession(p, providers=["CPUExecutionProvider"]).get_inputs()]
-              if "input_features" in names:
-                  enc_path = p
-              else:
-                  dec_path = p
-              del names
-          assert enc_path and dec_path, f"onnx 定位失败: enc={enc_path} dec={dec_path}"
-          print(f"encoder: {enc_path}\ndecoder: {dec_path}")
-
-          # ---------- 2. 真实语音 -> log-mel (LibriSpeech test-clean, 流式下载) ----------
+          # ---------- 1. 真实语音 -> log-mel (LibriSpeech test-clean, 流式) ----------
           from transformers import WhisperFeatureExtractor
           from datasets import load_dataset
           fe = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3")
@@ -203,78 +187,55 @@ jobs:
                   break
           print(f"mel 校准样本: {len(mels)} 条, shape {mels[0].shape}")
 
-          # ---------- 3. encoder 校准数据 ----------
-          enc_sess = ort.InferenceSession(enc_path, providers=["CPUExecutionProvider"])
-          enc_out_names = [o.name for o in enc_sess.get_outputs()]
-          enc_calib = {"input_features": [m[None] for m in mels]}
+          # ---------- 2. 猴子补丁: 用真实 mel 替换官方校准数据 ----------
+          orig_get_calib = quantization_utils.get_calibration_data
 
-          # ---------- 4. decoder 校准数据 ----------
-          # 用真实 mel 过一遍 encoder 拿 cross cache; self cache / mask / ids 用
-          # 形状合法的模拟值 —— AIMET min-max 只需要覆盖激活数值范围, 不要求
-          # 语义正确的解码序列。
-          dec_sess = ort.InferenceSession(dec_path, providers=["CPUExecutionProvider"])
-          dec_inputs = dec_sess.get_inputs()
-          dec_calib = {i.name: [] for i in dec_inputs}
-          cross_in_names = sorted([n for n in dec_calib if "cross" in n])
-          cross_out = {n: enc_out_names[i] for i, n in enumerate(cross_in_names)} \
-                      if not set(cross_in_names) <= set(enc_out_names) else \
-                      {n: n for n in cross_in_names}
+          def patched(model, input_spec_arg=None, num_samples=None,
+                      component_name=None, dataset_options=None, app=None):
+              if component_name is None or not isinstance(input_spec_arg, dict):
+                  return orig_get_calib(model, input_spec_arg, num_samples,
+                                        component_name, dataset_options, app)
+              spec = input_spec_arg[component_name]
+              if "input_features" in spec:
+                  print(f"[calib] {component_name}: 真实语音 mel x{len(mels)}")
+                  return make_hub_dataset_entries((mels,), ["input_features"])
+              # decoder: 形状/类型与 input_spec 精确对齐的合成校准数据
+              print(f"[calib] {component_name}: 合成校准 x{DEC_N} (input_spec 对齐)")
+              names = list(spec.keys())
+              data = {n: [] for n in names}
+              rng = np.random.default_rng(0)
+              for _ in range(DEC_N):
+                  for n in names:
+                      shape = tuple(spec[n].shape)
+                      dt = np.dtype(spec[n].dtype)
+                      if n == "input_ids":
+                          data[n].append(np.array([[50258]], dtype=dt))  # <|startoftranscript|>
+                      elif "position" in n:
+                          data[n].append(np.zeros(shape, dtype=dt))
+                      elif "attention_mask" in n:
+                          data[n].append(np.zeros(shape, dtype=dt))
+                      else:  # kv caches
+                          data[n].append((rng.standard_normal(shape) * 0.5).astype(dt))
+              return make_hub_dataset_entries(tuple(data[n] for n in names), names)
 
-          for si, m in enumerate(mels[:DEC_N]):
-              print(f"decoder 校准样本 {si+1}/{DEC_N}: 跑 encoder ...")
-              outs = enc_sess.run(enc_out_names, {"input_features": m[None]})
-              enc_map = dict(zip(enc_out_names, outs))
-              sample = {}
-              for inp in dec_inputs:
-                  n = inp.name
-                  dims = [d if isinstance(d, int) else None for d in inp.shape]
-                  if "cross" in n:
-                      sample[n] = np.ascontiguousarray(enc_map[cross_out[n]], dtype=np.float32)
-                  elif "self" in n:
-                      shape = [1 if d is None else d for d in dims]
-                      if len(shape) == 4:
-                          shape[2] = PAST
-                      sample[n] = (np.random.randn(*shape) * 0.5).astype(np.float32)
-                  elif n == "input_ids":
-                      sample[n] = np.array([[50258, 50259, 50359][:TQ]], dtype=np.int64)
-                  elif "attention_mask" in n:
-                      width = dims[-1] if dims[-1] else PAST + TQ
-                      sample[n] = np.ones([1 if d is None else d for d in dims[:-1]] + [width],
-                                          dtype=np.int64)
-                  elif "position" in n:
-                      shape = [1 if d is None else d for d in dims]
-                      sample[n] = np.full(shape, PAST + TQ - 1, dtype=np.int64)
-                  else:
-                      shape = [1 if d is None else d for d in dims]
-                      sample[n] = np.zeros(shape, dtype=np.float32)
-              for k, v in sample.items():
-                  dec_calib[k].append(v)
-          print("decoder 校准数据构造完成")
+          quantization_utils.get_calibration_data = patched
 
-          # ---------- 5. 云端量化 (AIMET 在高通服务器上跑) ----------
-          def quantize_and_compile(onnx_path, calib, tag):
-              print(f"[{tag}] 上传 float onnx ...")
-              model = hub.upload_model(onnx_path)
-              print(f"[{tag}] 提交量化任务 (w8a16: INT8 权重 + INT16 激活) ...")
-              qjob = hub.submit_quantize_job(
-                  model, calib,
-                  weights_dtype=hub.QuantizeDtype.INT8,
-                  activations_dtype=hub.QuantizeDtype.INT16)
-              qmodel = qjob.get_target_model()
-              print(f"[{tag}] 提交编译任务 (precompiled_qnn_onnx) ...")
-              cjob = hub.submit_compile_job(
-                  qmodel, device=hub.get_device(DEVICE),
-                  options="--target_runtime precompiled_qnn_onnx")
-              compiled = cjob.get_target_model()
-              out = f"export_assets/{tag}_w8a16_precompiled_qnn_onnx.onnx"
-              compiled.download(out)
-              print(f"[{tag}] 完成 -> {out}")
-
-          quantize_and_compile(enc_path, enc_calib, "encoder")
-          quantize_and_compile(dec_path, dec_calib, "decoder")
-          print("全部完成")
+          # ---------- 3. 调官方管线: 量化+编译全部在 AI Hub 云端完成 ----------
+          export_model = resolve_export_model(MODEL_ID)
+          device = hub.Device(name=DEVICE, attributes=[], os="")
+          export_model(
+              MODEL_ID,
+              device=device,
+              precision=Precision.w8a16,
+              target_runtime=TargetRuntime.PRECOMPILED_QNN_ONNX,
+              skip_profiling=True,
+              skip_inferencing=True,
+              output_dir="export_assets",
+          )
+          print("w8a16 云端量化+编译完成")
           PYEOF
-          python /tmp/hub_quantize_compile.py
+          python /tmp/hub_quantize_export.py
+          find export_assets -maxdepth 3 -type f | head -30
 
       - name: 打包产物 (按 1.8GB 分卷, 绕过单 artifact 2GB 限制)
         if: ${{ !inputs.list_devices }}
