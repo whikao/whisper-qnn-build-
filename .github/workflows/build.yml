@@ -102,7 +102,7 @@ jobs:
       - name: 安装 w8a16 额外依赖 (真实语音校准数据生成用)
         if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
         run: |
-          pip install datasets soundfile librosa
+          pip install soundfile
 
       - name: 检查 w8a16 支持的模型
         if: ${{ !inputs.list_devices && inputs.precision == 'w8a16' }}
@@ -176,15 +176,22 @@ jobs:
           DEC_N = int(os.environ.get("DEC_CALIB", "64"))
 
           # ---------- 1. 真实语音 -> log-mel (LibriSpeech test-clean, 流式) ----------
+          import io
+          import soundfile as sf
           from transformers import WhisperFeatureExtractor
-          from datasets import load_dataset
+          from datasets import load_dataset, Audio
           fe = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3")
+          # decode=False: 不让 datasets 用 torchcodec 解码, 拿原始 flac 字节
+          # 用 soundfile 自己解 (LibriSpeech 是 16kHz 单声道 flac, 无需重采样)
           ds = load_dataset("librispeech_asr", "clean", split="test",
                             streaming=True, trust_remote_code=True)
+          ds = ds.cast_column("audio", Audio(decode=False))
           mels = []
           for ex in ds:
-              f = fe(ex["audio"]["array"], sampling_rate=ex["audio"]["sampling_rate"],
-                     return_tensors="np").input_features[0]
+              audio, sr = sf.read(io.BytesIO(ex["audio"]["bytes"]), dtype="float32")
+              if audio.ndim > 1:
+                  audio = audio.mean(axis=1)
+              f = fe(audio, sampling_rate=sr, return_tensors="np").input_features[0]
               mels.append(f.astype(np.float32))
               if len(mels) >= ENC_N:
                   break
