@@ -18,8 +18,8 @@
 #          (找带 "8 Elite Gen 5" / "Galaxy S26" / "Redmi K90" / "OnePlus 15"
 #           字样的), 然后把它填到 device 输入框正式跑
 #
-# 产物: Artifacts 里下载 xxx.zip / xxx.z01 ... 全部分卷后:
-#        7z x xxx.zip        (7z 自动连读分卷)
+# 产物: Artifacts 里下载 xxx-precompiled-qnn-onnx.zip (单个整包, 约 3GB):
+#        7z x xxx.zip
 #   解压后目录结构和你现在的 turbo 包一样, 手机上:
 #        ./whisper_qnn xxx.wav -m <解压目录> -t <tokens.txt> --vad ... -o out.srt
 #   tokens.txt 继续用 sherpa-onnx whisper-medium 那份 (v2/v3 文本 token 一致)
@@ -146,21 +146,16 @@ jobs:
             --target-runtime precompiled_qnn_onnx \
             --device "${{ inputs.device }}"
 
-      - name: 打包产物 (按 1.8GB 分卷, 绕过单 artifact 2GB 限制)
+      - name: 列出产物 (核对文件大小, 防止静默缺文件)
         if: ${{ !inputs.list_devices }}
-        run: |
-          find export_assets -maxdepth 3 -type f | head -50
-          cd export_assets
-          zip -0 -r -s 1800m "../${{ inputs.model_id }}_precompiled_qnn_onnx.zip" .
-          cd ..
-          ls -la *.zip*
+        run: find export_assets -maxdepth 3 -type f -exec ls -la {} \;
 
-      - name: 上传编译产物
+      - name: 上传编译产物 (直接传文件夹, 不分卷; artifact 没有 2GB 单文件限制)
         if: ${{ !inputs.list_devices }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.model_id }}-precompiled-qnn-onnx
-          path: ${{ inputs.model_id }}*_precompiled_qnn_onnx.zip*
+          path: export_assets/
           compression-level: 0
           retention-days: 7
 
@@ -455,18 +450,13 @@ jobs:
           python /tmp/hub_build_from_quantize.py
           find export_assets -maxdepth 3 -type f | head -30
 
-      - name: 打包产物 (按 1.8GB 分卷, 绕过单 artifact 2GB 限制)
-        run: |
-          find export_assets -maxdepth 3 -type f | head -50
-          cd export_assets
-          zip -0 -r -s 1800m "../${{ inputs.model_id }}_quantized_precompiled_qnn_onnx.zip" .
-          cd ..
-          ls -la *.zip*
+      - name: 列出产物 (核对文件大小, 防止静默缺文件)
+        run: find export_assets -maxdepth 3 -type f -exec ls -la {} \;
 
-      - name: 上传编译产物
+      - name: 上传编译产物 (直接传文件夹, 不分卷; artifact 没有 2GB 单文件限制)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.model_id }}-quantized-precompiled-qnn-onnx
-          path: ${{ inputs.model_id }}*_precompiled_qnn_onnx.zip*
+          path: export_assets/
           compression-level: 0
           retention-days: 7
