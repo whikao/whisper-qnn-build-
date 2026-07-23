@@ -264,7 +264,8 @@ jobs:
               if audio.ndim > 1:
                   audio = audio.mean(axis=1)
               f = fe(audio, sampling_rate=sr, return_tensors="np").input_features[0]
-              mels.append(f.astype(np.float32))
+              # 量化服务要求每个样本带 batch 维: (1, 128, 3000)
+              mels.append(f[None].astype(np.float32))
               if len(mels) >= ENC_N:
                   break
           print(f"mel 校准样本: {len(mels)} 条, shape {mels[0].shape}")
