@@ -410,27 +410,14 @@ jobs:
           MODEL_ID = "whisper_large_v3"
 
           def wait_job(job, tag):
-              """等待任务完成; 兼容不同版本客户端的等待 API"""
-              if hasattr(job, "wait"):
-                  try:
-                      job.wait()
-                      return
-                  except TypeError:
-                      pass
-              for i in range(240):  # 最多 4 小时
-                  st = ""
-                  try:
-                      st = str(job.get_status())
-                  except Exception:
-                      st = str(getattr(job, "status", ""))
-                  print(f"[{tag}] {i}min: {st}")
-                  up = st.upper()
-                  if "SUCCESS" in up:
-                      return
-                  if "FAIL" in up or "ERROR" in up:
-                      raise RuntimeError(f"{tag} 失败: {st}")
-                  time.sleep(60)
-              raise TimeoutError(f"{tag} 等待超时")
+              """阻塞到任务结束, 打印最终状态和错误消息 (源码: wait() 返回
+              最终 JobStatus, 含 code 和 message 字段)"""
+              status = job.wait()  # 阻塞至 SUCCESS 或 FAILED
+              code = getattr(status, "code", str(status))
+              msg = getattr(status, "message", "")
+              print(f"[{tag}] 最终状态: {code} {msg}")
+              if "SUCCESS" not in str(code).upper():
+                  raise RuntimeError(f"{tag} 失败: {code} {msg}")
 
           # ---------- 1. 按任务 ID 轮询量化结果 ----------
           ids = json.load(open("quantize_jobs.json"))
