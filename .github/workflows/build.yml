@@ -443,6 +443,9 @@ jobs:
               precision=Precision.w8a16,
               target_runtime=TargetRuntime.PRECOMPILED_QNN_ONNX,
               quantized_model_id=qmodels,   # 跳过量化, 直接编译
+              # 默认 O3 编译 large-v3 会在服务器超时 (实测 4h+ 失败),
+              # O2 折中: 编译时间可控, 推理性能损失比 O1 小
+              compile_options="--qnn_context_binary_optimization_level 2",
               skip_profiling=True,
               skip_inferencing=True,
               output_dir="export_assets",
