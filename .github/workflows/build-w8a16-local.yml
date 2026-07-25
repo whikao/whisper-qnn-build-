@@ -156,7 +156,9 @@ jobs:
 
       - name: 安装 converter 的 Python 依赖 + 配置 QAIRT Python 环境
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip
+          # libc++1/libc++abi1: qti 转换器的原生模块 (libPyIrGraph312) 是
+          # clang 体系编的, 需要 LLVM libc++ 运行时, Ubuntu 默认不带
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip libc++1 libc++abi1
           pip install "numpy<2" onnx protobuf packaging pyyaml
           # QAIRT 的 python 包 (qti.aisw.converters) 在 SDK 的 lib/python 下
           export PYTHONPATH="$QAIRT_ROOT/lib/python:$PYTHONPATH"
