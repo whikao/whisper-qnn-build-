@@ -192,7 +192,7 @@ jobs:
           [ -n "$ONNX" ] || { echo "::error::找不到 ${{ matrix.component }} 的 onnx"; exit 1; }
           echo "量化 ONNX: $ONNX"
           # QDQ (QuantizeLinear/DequantizeLinear 内嵌) 直接转, 量化参数随图走
-          qnn-onnx-converter --input_model "$ONNX" \
+          qnn-onnx-converter --input_network "$ONNX" \
             --output_path ${{ matrix.component }}.cpp
           qnn-model-lib-generator \
             -c ${{ matrix.component }}.cpp \
