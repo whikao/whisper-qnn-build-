@@ -39,6 +39,12 @@
 #   校准数据: 猴子补丁官方校准函数, encoder 用真实 LibriSpeech 语音
 #   算出的 log-mel (150 条), decoder 用与 input_spec 精确对齐的合成数据。
 #   注意: 脚本按 qai_hub_models 0.58.0 源码核对, 已钉死版本。
+#
+# 2026-07-25 更新: 两条路径统一钉死 QAIRT 2.47.0 (AI Hub 当前 latest,
+#   默认 default 是 2.45.0)。原因: 2026-07-06 AI Hub 更新 —— 量化器升
+#   AIMET 2.34 (修了量化 ONNX 带非法 dequantize 节点的 bug, 7/6 前的量化
+#   结果建议重交); 编译器新增 rank6->4 合并 / RMSNorm 融合 / Einsum 降级
+#   等图优化, 对大 Transformer 编译速度和产物性能都有利。
 # ============================================================================
 
 name: Convert Whisper to QNN EPContext
@@ -117,6 +123,9 @@ jobs:
         if: inputs.list_devices
         run: qai-hub list-devices
 
+      - name: 列出当前可选 QAIRT 版本 (诊断, 确认 2.47 在列表里)
+        run: qai-hub list-frameworks || true
+
       - name: 注册 whisper_large_v3 变体 (复制 turbo 配方, 改 HF 型号)
         if: ${{ !inputs.list_devices && inputs.model_id == 'whisper_large_v3' }}
         run: |
@@ -139,12 +148,13 @@ jobs:
           ! grep -rn "Turbo\|turbo" *.py | grep -v README || true
           python -c "import importlib; m = importlib.import_module('qai_hub_models.models.whisper_large_v3'); print('注册成功:', m.Model)"
 
-      - name: 导出 ONNX + AI Hub 云编译为 EPContext (float 路径)
+      - name: 导出 ONNX + AI Hub 云编译为 EPContext (float 路径, 钉 QAIRT 2.47.0)
         if: ${{ !inputs.list_devices }}
         run: |
           python -m "qai_hub_models.models.${{ inputs.model_id }}.export" \
             --target-runtime precompiled_qnn_onnx \
-            --device "${{ inputs.device }}"
+            --device "${{ inputs.device }}" \
+            --compile-options "--qairt_version 2.47.0"
 
       - name: 列出产物 (核对文件大小, 防止静默缺文件)
         if: ${{ !inputs.list_devices }}
@@ -390,7 +400,7 @@ jobs:
           echo 'status_reason: "CI-registered custom variant, not an official release."' >> info.yaml
           python -c "import importlib; m = importlib.import_module('qai_hub_models.models.whisper_large_v3'); print('注册成功:', m.Model)"
 
-      - name: 轮询量化结果 + 云端编译 EPContext + 下载 (耗时步骤)
+      - name: 轮询量化结果 + 云端编译 EPContext + 下载 (耗时步骤, 钉 QAIRT 2.47.0)
         env:
           QAI_DEVICE: ${{ inputs.device }}
         run: |
@@ -438,9 +448,11 @@ jobs:
               precision=Precision.w8a16,
               target_runtime=TargetRuntime.PRECOMPILED_QNN_ONNX,
               quantized_model_id=qmodels,   # 跳过量化, 直接编译
-              # 默认 O3 编译 large-v3 会在服务器超时 (实测 4h+ 失败),
-              # O2 折中: 编译时间可控, 推理性能损失比 O1 小
-              compile_options="--qnn_context_binary_optimization_level 1",
+              # O3/O2 编译 large-v3 会在服务器超时 (实测 4h+ 失败), 用 O1;
+              # --qairt_version 2.47.0: 叠上 2026-07-06 新增的图优化
+              # (rank6->4 合并 / RMSNorm 融合 / Einsum 降级), 是大模型编译
+              # 能挤进平台单 job 时限的最大机会
+              compile_options="--qnn_context_binary_optimization_level 1 --qairt_version 2.47.0",
               skip_profiling=True,
               skip_inferencing=True,
               output_dir="export_assets",
