@@ -154,7 +154,7 @@ jobs:
           python -m "qai_hub_models.models.${{ inputs.model_id }}.export" \
             --target-runtime precompiled_qnn_onnx \
             --device "${{ inputs.device }}" \
-            --compile-options "--qairt_version 2.47.0"
+            --compile-options "--qairt_version 2.47"
 
       - name: 列出产物 (核对文件大小, 防止静默缺文件)
         if: ${{ !inputs.list_devices }}
@@ -452,7 +452,7 @@ jobs:
               # --qairt_version 2.47.0: 叠上 2026-07-06 新增的图优化
               # (rank6->4 合并 / RMSNorm 融合 / Einsum 降级), 是大模型编译
               # 能挤进平台单 job 时限的最大机会
-              compile_options="--qnn_context_binary_optimization_level 1 --qairt_version 2.47.0",
+              compile_options="--qnn_context_binary_optimization_level 1 --qairt_version 2.47",
               skip_profiling=True,
               skip_inferencing=True,
               output_dir="export_assets",
