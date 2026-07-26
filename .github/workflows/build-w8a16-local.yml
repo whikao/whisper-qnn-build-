@@ -206,7 +206,10 @@ jobs:
             --no-large-tensor --no-model-check || \
             { echo "onnxsim 失败, 用原模型继续"; cp "$ONNX" "$ONNXDIR/model_sim.onnx"; }
           # QDQ (QuantizeLinear/DequantizeLinear 内嵌) 直接转, 量化参数随图走
-          time qnn-onnx-converter --input_network "$ONNXDIR/model_sim.onnx" \
+          # -n/--no_simplification: 关掉 converter 内部自带的化简+校验 —
+          # 我们已用 onnxsim 外部化简过, 它内部那套在 3GB 图上要磨 5+ 小时
+          # (实测两次撞 6h 上限都死在这), 纯属重复劳动
+          time qnn-onnx-converter -n --input_network "$ONNXDIR/model_sim.onnx" \
             --output_path ${{ matrix.component }}.cpp
           time qnn-model-lib-generator \
             -c ${{ matrix.component }}.cpp \
