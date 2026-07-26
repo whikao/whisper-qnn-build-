@@ -116,9 +116,12 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # Job 2: 本地 QAIRT 编译 v81 context bin (encoder/decoder 并行)
+  # Job 2: onnxsim 预化简 + QDQ ONNX -> QNN 模型库 (encoder/decoder 并行)
+  #   教训: 不预化简直接转 3GB QDQ 图, 转换器磨了 4h40m 没出来, 整个 job
+  #   撞 6h 上限。所以: ① 先 onnxsim 化简; ② 转换和 context 生成拆成两个
+  #   job, 各自独享 6 小时额度。
   # ==========================================================================
-  compile_context:
+  convert_qnn:
     needs: download_quantized
     runs-on: ubuntu-latest
     timeout-minutes: 360          # GitHub 免费 job 硬上限 6 小时
@@ -171,7 +174,7 @@ jobs:
             pyyaml==6.0.3 rich==13.9.4 scikit-optimize==0.9.0 scipy==1.15.3 \
             six==1.16.0 tabulate==0.9.0 typing-extensions==4.14.0 \
             xlsxwriter==1.2.2 \
-            onnx protobuf
+            onnx protobuf onnxsim onnxruntime
           # QAIRT 的 python 包 (qti.aisw.converters) 在 SDK 的 lib/python 下
           export PYTHONPATH="$QAIRT_ROOT/lib/python:$PYTHONPATH"
           echo "PYTHONPATH=$QAIRT_ROOT/lib/python:\$PYTHONPATH" >> $GITHUB_ENV
@@ -191,17 +194,65 @@ jobs:
           ONNX=$(find quantized_onnx -name "*.onnx" | grep -i "${{ matrix.component }}" | head -1)
           [ -n "$ONNX" ] || { echo "::error::找不到 ${{ matrix.component }} 的 onnx"; exit 1; }
           echo "量化 ONNX: $ONNX"
+          # onnxsim 预化简 (关键提速: 常量折叠/冗余消除先砍掉一大半图,
+          # 实测不化简转换器 4h40m 转不完)。外置 model.data 同目录自动跟随
+          ONNXDIR=$(dirname "$ONNX")
+          time python3 -m onnxsim "$ONNX" "$ONNXDIR/model_sim.onnx" || \
+            { echo "onnxsim 失败, 用原模型继续"; cp "$ONNX" "$ONNXDIR/model_sim.onnx"; }
           # QDQ (QuantizeLinear/DequantizeLinear 内嵌) 直接转, 量化参数随图走
-          qnn-onnx-converter --input_network "$ONNX" \
+          time qnn-onnx-converter --input_network "$ONNXDIR/model_sim.onnx" \
             --output_path ${{ matrix.component }}.cpp
-          qnn-model-lib-generator \
+          time qnn-model-lib-generator \
             -c ${{ matrix.component }}.cpp \
             -b ${{ matrix.component }}.bin \
             -t x86_64-linux-clang \
             -o model_libs
           ls -la model_libs/x86_64-linux-clang/
 
-      - name: 生成 HTP v81 context binary (重活, 本地无平台时限)
+      - name: 上传 QNN 模型库 (交接给下一个 job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.component }}-qnn-lib
+          path: model_libs/x86_64-linux-clang/
+          compression-level: 0
+          retention-days: 7
+
+  # ==========================================================================
+  # Job 3: 生成 HTP v81 context binary (重活, 独享 6 小时额度)
+  # ==========================================================================
+  gen_context:
+    needs: convert_qnn
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [encoder, decoder]
+    env:
+      QAIRT_VER: ${{ inputs.qairt_version }}
+    steps:
+      - name: 清理磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/lib/jvm || true
+          docker system prune -af 2>/dev/null || true
+          df -h /
+
+      - name: 下载 QNN 模型库
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.component }}-qnn-lib
+          path: model_libs/x86_64-linux-clang
+
+      - name: 下载 QAIRT SDK (带 UA, 已验证免登录直链)
+        run: |
+          wget -q --user-agent="$UA" \
+            "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VER}/v${QAIRT_VER}.zip" \
+            -O qairt.zip
+          unzip -q qairt.zip
+          export QAIRT_ROOT="$PWD/qairt/${QAIRT_VER}"
+          echo "QAIRT_ROOT=$QAIRT_ROOT" >> $GITHUB_ENV
+
+      - name: 生成 HTP v81 context binary
         run: |
           set -e
           export LD_LIBRARY_PATH="$QAIRT_ROOT/lib/x86_64-linux-clang:$LD_LIBRARY_PATH"
@@ -213,7 +264,6 @@ jobs:
             "graphs": [ { "vtcm_mb": 8, "hvx_threads": 8 } ]
           }
           EOF
-          python3 -c "import json; json.load(open('htp_backend_config.json'))"  # 去缩进校验
           cat > sdk_config.json <<EOF
           {
             "backend_extensions": {
@@ -222,7 +272,7 @@ jobs:
             }
           }
           EOF
-          qnn-context-binary-generator \
+          time qnn-context-binary-generator \
             --model model_libs/x86_64-linux-clang/lib${{ matrix.component }}.so \
             --backend "$QAIRT_ROOT/lib/x86_64-linux-clang/libQnnHtp.so" \
             --binary_file ${{ matrix.component }}_qairt_context.bin \
