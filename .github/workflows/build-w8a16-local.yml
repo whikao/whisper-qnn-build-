@@ -197,7 +197,9 @@ jobs:
           # onnxsim 预化简 (关键提速: 常量折叠/冗余消除先砍掉一大半图,
           # 实测不化简转换器 4h40m 转不完)。外置 model.data 同目录自动跟随
           ONNXDIR=$(dirname "$ONNX")
-          time python3 -m onnxsim "$ONNX" "$ONNXDIR/model_sim.onnx" || \
+          # --no-large-tensor: 跳过对大常量(权重)的折叠, 避免 >2GB 模型
+          # 触发外置数据重写 (慢且吃内存); 大常量 QNN 编译器自己会处理
+          time python3 -m onnxsim "$ONNX" "$ONNXDIR/model_sim.onnx" --no-large-tensor || \
             { echo "onnxsim 失败, 用原模型继续"; cp "$ONNX" "$ONNXDIR/model_sim.onnx"; }
           # QDQ (QuantizeLinear/DequantizeLinear 内嵌) 直接转, 量化参数随图走
           time qnn-onnx-converter --input_network "$ONNXDIR/model_sim.onnx" \
