@@ -1,0 +1,128 @@
+# ============================================================================
+# Conv1d -> Conv2d 模型改写服务 (绕 ORT QNN EP 的 NHWC bug)
+#
+# 背景: 手机上 ORT QNN EP 编译 QDQ whisper 时, Conv1d 触发布局变换 bug
+#   (com.ms.internal.nhwc ... graph is now invalid), 1.27/1.29 均存在。
+#   本 workflow 在 runner 上把量化 ONNX 里的 Conv1d 改写成等价 Conv2d。
+#
+# 产物: Artifacts 里 encoder_fixed / decoder_fixed
+#   - model.onnx 必有 (几 MB, 新增形状常量已内嵌)
+#   - model.data 仅在内容有变化时才上传; 若日志显示 md5 与原模型一致,
+#     手机上继续用原 model.data 即可, 只需下载 model.onnx
+#
+# 输入: 量化任务 ID (和 build-w8a16-local 用的一对)
+# ============================================================================
+
+name: Rewrite Conv1d to Conv2d
+
+on:
+  workflow_dispatch:
+    inputs:
+      encoder_quant_job:
+        description: "encoder 量化任务 ID"
+        required: true
+      decoder_quant_job:
+        description: "decoder 量化任务 ID"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: encoder
+            job_id: ${{ inputs.encoder_quant_job }}
+          - component: decoder
+            job_id: ${{ inputs.decoder_quant_job }}
+    steps:
+      - uses: actions/checkout@v4   # 拉仓库, 根目录的 fix_conv1d.py 才有
+
+      - name: 清理磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/lib/jvm || true
+          docker system prune -af 2>/dev/null || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "qai-hub" onnx
+
+      - name: 配置 AI Hub API token
+        run: |
+          qai-hub configure --api_token "${{ secrets.QAI_HUB_API_TOKEN }}" || {
+            mkdir -p ~/.qai_hub
+            printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
+          }
+
+      - name: 下载量化模型 (按任务 ID)
+        env:
+          JID: ${{ matrix.job_id }}
+          COMP: ${{ matrix.component }}
+        run: |
+          mkdir -p orig
+          python - <<'PYEOF'
+          import os, qai_hub as hub
+          job = hub.get_job(os.environ["JID"])
+          status = job.wait()
+          print("状态:", status)
+          m = job.get_target_model()
+          p = m.download(f"orig/{os.environ['COMP']}.zip")
+          print("下载:", p)
+          PYEOF
+          cd orig && unzip -o *.zip && find . -type f | head
+
+      - name: 改写 Conv1d -> Conv2d
+        run: |
+          ONNX=$(find orig -name "model.onnx" | head -1)
+          SRCDIR=$(dirname "$ONNX")
+          echo "源模型: $ONNX"
+          cp "$SRCDIR/model.data" orig/model.data
+          cp "$ONNX" orig/model_src.onnx
+          mkdir -p srcdir fixed
+          cp "$ONNX" srcdir/model.onnx
+          cp "$SRCDIR/model.data" srcdir/model.data
+          python "$GITHUB_WORKSPACE/fix_conv1d.py" srcdir fixed
+          ls -la fixed/
+
+      - name: 对比 model.data 是否变化 (决定要不要下载 data)
+        id: datacmp
+        run: |
+          OLD_MD5=$(md5sum srcdir/model.data | cut -d' ' -f1)
+          NEW_MD5=$(md5sum fixed/model.data | cut -d' ' -f1)
+          echo "原 data md5: $OLD_MD5"
+          echo "新 data md5: $NEW_MD5"
+          if [ "$OLD_MD5" = "$NEW_MD5" ]; then
+            echo "data_same=true" >> $GITHUB_OUTPUT
+            echo "✅ model.data 未变化, 手机上用原文件即可, 只需下载 model.onnx"
+          else
+            echo "data_same=false" >> $GITHUB_OUTPUT
+            echo "⚠️ model.data 有变化, 需要一并下载"
+          fi
+
+      - name: 上传 model.onnx (必传)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.component }}_fixed
+          path: fixed/model.onnx
+          compression-level: 0
+          retention-days: 7
+
+      - name: 上传 model.data (仅变化时)
+        if: steps.datacmp.outputs.data_same == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.component }}_fixed_data
+          path: fixed/model.data
+          compression-level: 0
+          retention-days: 7
