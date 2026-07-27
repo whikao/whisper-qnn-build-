@@ -1,0 +1,150 @@
+# ============================================================================
+# QDQ 模型拆图服务 (绕手机端 QNN graph prepare 内存上限)
+#
+# 背景: 手机 ORT EPContext 编译 w8a16 whisper large-v3 时,
+#   QNN HTP prepare 整图 bad_alloc (14GB RAM 峰值不够, 三档优化均失败)。
+#   迷你模型已验证手机编译链路健康, 故把模型从中间劈成两半,
+#   每半节点数减半, prepare 内存峰值随之减半, 手机即可编译。
+#
+# 做法: 在第 16 个 block 的入口处切一刀 (large-v3 共 32 层),
+#   part1 = 输入 -> 切点, part2 = 切点 -> 输出。
+#   用 onnx.utils.extract_model 抽取, 权重内嵌成单文件 (每半 <2GB)。
+#
+# 产物: Artifacts 里 encoder_part1/2, decoder_part1/2 (各为单文件 .onnx)
+#
+# 输入: 量化任务 ID (和 build-w8a16-local 用的一对)
+# ============================================================================
+
+name: Split QDQ model in half
+
+on:
+  workflow_dispatch:
+    inputs:
+      encoder_quant_job:
+        description: "encoder 量化任务 ID"
+        required: true
+      decoder_quant_job:
+        description: "decoder 量化任务 ID"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: encoder
+            job_id: ${{ inputs.encoder_quant_job }}
+          - component: decoder
+            job_id: ${{ inputs.decoder_quant_job }}
+    steps:
+      - name: 清理磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/lib/jvm || true
+          docker system prune -af 2>/dev/null || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "qai-hub" onnx
+
+      - name: 配置 AI Hub API token
+        run: |
+          qai-hub configure --api_token "${{ secrets.QAI_HUB_API_TOKEN }}" || {
+            mkdir -p ~/.qai_hub
+            printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
+          }
+
+      - name: 下载量化模型 (按任务 ID)
+        env:
+          JID: ${{ matrix.job_id }}
+          COMP: ${{ matrix.component }}
+        run: |
+          mkdir -p orig
+          python - <<'PYEOF'
+          import os, qai_hub as hub
+          job = hub.get_job(os.environ["JID"])
+          status = job.wait()
+          print("状态:", status)
+          m = job.get_target_model()
+          p = m.download(f"orig/{os.environ['COMP']}.zip")
+          print("下载:", p)
+          PYEOF
+          cd orig && unzip -o *.zip && find . -type f | head
+
+      - name: 从第 16 层处拆成两半
+        env:
+          COMP: ${{ matrix.component }}
+        run: |
+          python - <<'PYEOF'
+          import os, re, onnx
+          from onnx.utils import extract_model
+
+          comp = os.environ["COMP"]
+          src = None
+          for root, _, files in os.walk("orig"):
+              for f in files:
+                  if f == "model.onnx":
+                      src = os.path.join(root, f)
+          assert src, "没找到 model.onnx"
+          print("源模型:", src)
+
+          # 连外部权重一起加载 (extract_model 需要完整 ModelProto)
+          model = onnx.load(src, load_external_data=True)
+          g = model.graph
+          init_names = {t.name for t in g.initializer}
+          print(f"总节点数: {len(g.node)}, 权重数: {len(g.initializer)}")
+
+          # 找切点: 拓扑序里第一个属于 "/{comp}/16/" 的节点,
+          # 取它第一个"非权重"输入作为切面张量
+          pat = f"/{comp}/16/"
+          cut_tensor = None
+          cut_node = None
+          for node in g.node:
+              if pat in node.name:
+                  for inp in node.input:
+                      if inp and inp not in init_names:
+                          cut_tensor = inp
+                          cut_node = node.name
+                          break
+              if cut_tensor:
+                  break
+          assert cut_tensor, f"没找到 {pat} 的切点, 打印层名样本:"
+          print(f"切点节点: {cut_node}")
+          print(f"切面张量: {cut_tensor}")
+
+          in_names  = [i.name for i in g.input]
+          out_names = [o.name for o in g.output]
+
+          os.makedirs("split", exist_ok=True)
+          p1 = f"split/{comp}_part1.onnx"
+          p2 = f"split/{comp}_part2.onnx"
+
+          # part1: 图输入 -> 切面; part2: 切面 -> 图输出
+          extract_model(src, p1, in_names, [cut_tensor])
+          extract_model(src, p2, [cut_tensor], out_names)
+
+          for p in (p1, p2):
+              m = onnx.load(p)  # 不加载外部数据, 只看结构
+              sz = os.path.getsize(p)
+              data = os.path.splitext(p)[0] + ".data"
+              dsz = os.path.getsize(data) if os.path.exists(data) else 0
+              print(f"{p}: 节点 {len(m.graph.node)}, onnx {sz/1e6:.1f}MB, data {dsz/1e6:.2f}MB")
+          PYEOF
+
+      - name: 上传拆图产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.component }}_split
+          path: split/
+          retention-days: 7
