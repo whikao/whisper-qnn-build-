@@ -1,0 +1,248 @@
+# ============================================================================
+# w8a16 分片云端编译 + 合并 (整图超时 5 次后的最终方案)
+#
+# 背景: AI Hub 整图编译 large-v3 w8a16, O1/O2/O3 全部撞 4h 平台上限;
+#   手机端编译 DSP 侧 prepare bad_alloc (MatMul->Conv 改写内存爆)。
+#   解法: 拆 4 份 (每份 8 层) -> 每份单独云端编译 (规模 1/4, 编得动)
+#   -> 合并成四分区 EPContext 模型 (ORT 原生支持, 推理程序零改动)。
+#
+# 输入:
+#   quant_job   : 量化任务 ID (产出 QDQ 模型的 job)
+#   component   : encoder / decoder
+#   device_name : AI Hub 设备名 (和以前编译任务一致)
+#   opt_level   : O=3 默认 (分片小, 高档也编得动); 超时再降 O=2/O=1
+#
+# 产物 artifact: {component}_w8a16_final/
+#   {component}_w8a16.onnx  (四分区 stub, 几 KB)
+#   {component}_p1~p4.bin   (4 个 context bin, 与 stub 同目录放置使用)
+# ============================================================================
+
+name: Cloud compile w8a16 in parts and merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      quant_job:
+        description: "量化任务 ID"
+        required: true
+      component:
+        description: "部件名 encoder/decoder"
+        required: true
+        default: encoder
+      device_name:
+        description: "AI Hub 设备名"
+        required: true
+        default: "Snapdragon 8 Elite Gen 5"
+      opt_level:
+        description: "HTP 优化档位"
+        required: true
+        default: "O=3"
+
+permissions:
+  contents: read
+
+jobs:
+  parts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: 清理磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/lib/jvm || true
+          docker system prune -af 2>/dev/null || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "qai-hub" onnx
+
+      - name: 配置 AI Hub API token
+        run: |
+          qai-hub configure --api_token "${{ secrets.QAI_HUB_API_TOKEN }}" || {
+            mkdir -p ~/.qai_hub
+            printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
+          }
+
+      - name: 打印候选设备名 (对照 device_name)
+        run: |
+          python - <<'PYEOF'
+          import qai_hub as hub
+          print([d.name for d in hub.get_devices() if "Elite" in d.name])
+          print("你填的是:", "${{ inputs.device_name }}")
+          PYEOF
+
+      - name: 下载 QDQ 模型
+        env:
+          JID: ${{ inputs.quant_job }}
+        run: |
+          mkdir -p orig
+          python - <<'PYEOF'
+          import os, qai_hub as hub
+          job = hub.get_job(os.environ["JID"])
+          print("量化任务状态:", job.wait())
+          job.get_target_model().download("orig/qdq.zip")
+          PYEOF
+          cd orig && unzip -o *.zip && find . -type f | head
+
+      - name: 拆成 4 份 (单文件 onnx)
+        env:
+          COMP: ${{ inputs.component }}
+        run: |
+          python - <<'PYEOF'
+          import os, onnx
+          from onnx.utils import extract_model
+
+          comp = os.environ["COMP"]
+          CUTS = [8, 16, 24]
+          src = None
+          for root, _, files in os.walk("orig"):
+              for f in files:
+                  if f == "model.onnx":
+                      src = os.path.join(root, f)
+          model = onnx.load(src, load_external_data=True)
+          g = model.graph
+          init_names = {t.name for t in g.initializer}
+          print(f"总节点 {len(g.node)}")
+
+          def find_cut(layer):
+              pat = f"/{comp}/{layer}/"
+              for node in g.node:
+                  if pat in node.name:
+                      for inp in node.input:
+                          if inp and inp not in init_names:
+                              print(f"  第{layer}层切点 <- {inp}")
+                              return inp
+              return None
+
+          bounds = [find_cut(L) for L in CUTS]
+          assert all(bounds), "切点没找全"
+          in_names  = [i.name for i in g.input]
+          out_names = [o.name for o in g.output]
+          segs = [(in_names, [bounds[0]]), ([bounds[0]], [bounds[1]]),
+                  ([bounds[1]], [bounds[2]]), ([bounds[2]], out_names)]
+
+          os.makedirs("parts", exist_ok=True)
+          for idx, (ins, outs) in enumerate(segs, 1):
+              tmp = f"parts/{comp}_part{idx}_ext.onnx"
+              fin = f"parts/{comp}_part{idx}.onnx"
+              extract_model(src, tmp, ins, outs)
+              m = onnx.load(tmp, load_external_data=True)
+              onnx.save_model(m, fin, save_as_external_data=False)
+              os.remove(tmp)
+              d = os.path.splitext(tmp)[0] + ".data"
+              if os.path.exists(d): os.remove(d)
+              print(f"part{idx}: 节点 {len(m.graph.node)}, {os.path.getsize(fin)/1e6:.1f}MB")
+          PYEOF
+
+      - name: 4 路并行提交云端编译, 全部等待
+        env:
+          DEV: ${{ inputs.device_name }}
+          OPT: ${{ inputs.opt_level }}
+          COMP: ${{ inputs.component }}
+        run: |
+          python - <<'PYEOF'
+          import os, qai_hub as hub
+
+          dev, opt, comp = os.environ["DEV"], os.environ["OPT"], os.environ["COMP"]
+          options = (f"--target_runtime precompiled_qnn_onnx "
+                     f"--qairt_version 2.48 "
+                     f"--qnn_options default_graph_htp_optimizations={opt}")
+          print("编译选项:", options)
+
+          jobs = []
+          for i in range(1, 5):
+              p = f"parts/{comp}_part{i}.onnx"
+              m = hub.upload_model(p)
+              j = hub.submit_compile_job(
+                  model=m, name=f"w8a16-{comp}-p{i}-{opt.replace('=','')}",
+                  device=hub.Device(dev), options=options)
+              print(f"part{i} 已提交: {j.job_id}")
+              jobs.append((i, j))
+
+          os.makedirs("ctx", exist_ok=True)
+          for i, j in jobs:
+              st = j.wait()
+              print(f"part{i} 状态: {st}")
+              tm = j.get_target_model()
+              assert tm, f"part{i} 编译失败, 去 AI Hub 看 job"
+              tm.download(f"ctx/part{i}.zip")
+              print(f"part{i} 产物已下载")
+          PYEOF
+          cd ctx && for i in 1 2 3 4; do mkdir -p p$i && (unzip -o part$i.zip -d p$i || tar xf part$i.zip -C p$i); done
+          find ctx -type f | head -30
+
+      - name: 合并成四分区 EPContext 模型
+        env:
+          COMP: ${{ inputs.component }}
+        run: |
+          python - <<'PYEOF'
+          import os, glob, shutil, onnx
+          from onnx import helper
+
+          comp = os.environ["COMP"]
+          os.makedirs("final", exist_ok=True)
+
+          nodes_all = []
+          graph_in = None
+          graph_out = None
+          vis = {}
+
+          for i in range(1, 5):
+              d = f"ctx/p{i}"
+              stub = glob.glob(os.path.join(d, "**", "*.onnx"), recursive=True)
+              bins = glob.glob(os.path.join(d, "**", "*.bin"), recursive=True)
+              assert stub and bins, f"part{i} 产物不齐: {stub} {bins}"
+              stub, binf = stub[0], bins[0]
+
+              # bin 重命名为部件专属, 并更新 stub 里的引用
+              new_bin = f"{comp}_p{i}.bin"
+              shutil.copy(binf, f"final/{new_bin}")
+              m = onnx.load(stub)
+              old_bin = os.path.basename(binf)
+              for node in m.graph.node:
+                  for attr in node.attribute:
+                      if attr.type == attr.STRING:
+                          v = attr.s.decode("utf-8", errors="ignore")
+                          if old_bin in v or v.endswith(".bin"):
+                              attr.s = new_bin.encode()
+                              print(f"part{i}: 节点 {node.name} 引用 {v} -> {new_bin}")
+                  nodes_all.append(node)
+
+              for vi in m.graph.input:
+                  if vi.name not in {t.name for t in m.graph.initializer}:
+                      if i == 1:
+                          graph_in = vi
+                      else:
+                          vis[vi.name] = vi
+              for vi in m.graph.output:
+                  if i == 4:
+                      graph_out = vi
+                  else:
+                      vis[vi.name] = vi
+              for vi in m.graph.value_info:
+                  vis[vi.name] = vi
+
+          assert graph_in is not None and graph_out is not None, "首尾输入输出缺失"
+          g = helper.make_graph(nodes_all, f"{comp}_w8a16_4parts",
+                                [graph_in], [graph_out], initializer=[],
+                                value_info=list(vis.values()))
+          mdl = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17),
+                                                    helper.make_opsetid("com.microsoft", 1)])
+          mdl.ir_version = 8
+          onnx.save(mdl, f"final/{comp}_w8a16.onnx")
+          print("合并完成:")
+          for f in sorted(os.listdir("final")):
+              print(" ", f, os.path.getsize(f"final/{f}")/1e6, "MB")
+          PYEOF
+
+      - name: 上传最终产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component }}_w8a16_final
+          path: final/
+          retention-days: 14
