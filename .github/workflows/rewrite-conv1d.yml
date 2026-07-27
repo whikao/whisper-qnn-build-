@@ -41,6 +41,8 @@ jobs:
           - component: decoder
             job_id: ${{ inputs.decoder_quant_job }}
     steps:
+      - uses: actions/checkout@v4   # 拉仓库, 根目录的 fix_conv1d.py 才有
+
       - name: 清理磁盘
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/lib/jvm || true
