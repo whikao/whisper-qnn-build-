@@ -131,6 +131,12 @@ jobs:
               fin = f"parts/{comp}_part{idx}.onnx"
               extract_model(src, tmp, ins, outs)
               m = onnx.load(tmp, load_external_data=True)
+              # 修 IR 合法性: 与图输入/输出同名的 value_info 必须删掉,
+              # 否则 AI Hub 优化器报 "occur in value_info but also in model IO"
+              io_names = {v.name for v in m.graph.input} | {v.name for v in m.graph.output}
+              keep = [vi for vi in m.graph.value_info if vi.name not in io_names]
+              del m.graph.value_info[:]
+              m.graph.value_info.extend(keep)
               onnx.save_model(m, fin, save_as_external_data=False)
               os.remove(tmp)
               d = os.path.splitext(tmp)[0] + ".data"
