@@ -42,6 +42,18 @@ def main():
     model = onnx.load(src_model)  # 外置数据同目录自动跟随
     g = model.graph
 
+    # ---- 探测: 打印图里所有 Conv 节点的完整信息 (不改图) ----
+    print("[probe] 图中全部 Conv 节点:")
+    for node in g.node:
+        if node.op_type != "Conv":
+            continue
+        attrs = {a.name: list(a.ints) if a.ints else (a.i if a.HasField('i') else a.name)
+                 for a in node.attribute}
+        print(f"  name={node.name}")
+        print(f"    inputs={list(node.input)}  outputs={list(node.output)}")
+        print(f"    attrs={attrs}")
+    print("[probe] 探测结束")
+
     new_nodes = []
     new_inits = []
     n_fixed = 0
