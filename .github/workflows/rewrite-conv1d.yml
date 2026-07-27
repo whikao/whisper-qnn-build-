@@ -78,7 +78,7 @@ jobs:
           p = m.download(f"orig/{os.environ['COMP']}.zip")
           print("下载:", p)
           PYEOF
-          cd orig && unzip -o ${COMP}.zip && find . -type f | head
+          cd orig && unzip -o *.zip && find . -type f | head
 
       - name: 改写 Conv1d -> Conv2d
         run: |
