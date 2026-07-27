@@ -82,20 +82,18 @@ jobs:
           PYEOF
           cd orig && unzip -o *.zip && find . -type f | head
 
-      - name: 改写 Conv1d -> Conv2d
+      - name: 探测 rank>4 节点 (QNN 上限 rank-4)
         run: |
           ONNX=$(find orig -name "model.onnx" | head -1)
-          SRCDIR=$(dirname "$ONNX")
           echo "源模型: $ONNX"
-          cp "$SRCDIR/model.data" orig/model.data
-          cp "$ONNX" orig/model_src.onnx
-          mkdir -p srcdir fixed
-          cp "$ONNX" srcdir/model.onnx
-          cp "$SRCDIR/model.data" srcdir/model.data
-          python "$GITHUB_WORKSPACE/fix_conv1d.py" srcdir fixed
-          ls -la fixed/
+          python "$GITHUB_WORKSPACE/rank_probe.py" "$ONNX" | tee rank_probe.log
+
+      - name: 改写 Conv1d -> Conv2d
+        if: false   # 暂停: Conv1d 改写已证明无关, 先看 rank 探测结果
+        run: echo skip
 
       - name: 对比 model.data 是否变化 (决定要不要下载 data)
+        if: false   # 暂停
         id: datacmp
         run: |
           OLD_MD5=$(md5sum srcdir/model.data | cut -d' ' -f1)
@@ -110,19 +108,9 @@ jobs:
             echo "⚠️ model.data 有变化, 需要一并下载"
           fi
 
-      - name: 上传 model.onnx (必传)
+      - name: 上传探测日志
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.component }}_fixed
-          path: fixed/model.onnx
-          compression-level: 0
-          retention-days: 7
-
-      - name: 上传 model.data (仅变化时)
-        if: steps.datacmp.outputs.data_same == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.component }}_fixed_data
-          path: fixed/model.data
-          compression-level: 0
+          name: ${{ matrix.component }}_rank_probe
+          path: rank_probe.log
           retention-days: 7
