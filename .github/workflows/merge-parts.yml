@@ -126,6 +126,15 @@ jobs:
                               renamed = True
                               print(f"part{i}: 节点 {node.name} 引用 {v} -> {new_bin}")
                   nodes_all.append(node)
+              # 节点输出名修复: stub 节点输出是通用名 output_0, 多分区合并会撞名;
+              # 改成该 stub 的 graph 输出名 (真实切面张量名, 链路自动接上)
+              if len(m.graph.node) == 1:
+                  nd = m.graph.node[0]
+                  reals = [vi.name for vi in m.graph.output]
+                  for j in range(len(nd.output)):
+                      if j < len(reals) and nd.output[j] != reals[j]:
+                          print(f"part{i}: 节点输出 {nd.output[j]} -> {reals[j]}")
+                          nd.output[j] = reals[j]
               if not renamed:
                   print(f"part{i}: 警告: 没找到 .bin 路径属性 (可能是内嵌模式), 合并后需检查")
 
