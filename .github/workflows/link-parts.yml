@@ -141,10 +141,14 @@ jobs:
       - name: 侦察 bin 内的图名/张量名 (给造 stub 用)
         run: |
           BIN=$(ls final/*.bin | head -1)
-          echo "===== 疑似图名 (model/graph 字样) ====="
-          strings "$BIN" | grep -iE "graph|part|g[0-9]+" | sort -u | head -30 || true
-          echo "===== 疑似 IO 张量名 ====="
-          strings "$BIN" | grep -E "encoder|decoder|cache|features|output|input" | sort -u | head -40 || true
+          echo "===== bin 大小 ====="
+          ls -la "$BIN"
+          echo "===== 图名候选 (含 dlc/w8a16/part 字样, 无斜杠, 按次数排) ====="
+          strings "$BIN" | grep -iE "dlc|w8a16|_p[0-9]|part|graph" | grep -v "/" | sort | uniq -c | sort -rn | head -40
+          echo "===== 顶层 IO 名候选 (无斜杠的 input/output/cache/features/logits 等) ====="
+          strings "$BIN" | grep -v "/" | grep -iE "^[a-z_0-9]*(input|output|cache|features|logits|token|position|kv)" | sort | uniq -c | sort -rn | head -60
+          echo "===== 重复出现 4 次左右的短名 (图名通常每图一份) ====="
+          strings "$BIN" | grep -v "/" | awk 'length($0)>=4 && length($0)<=40' | sort | uniq -c | awk '$1>=3 && $1<=6' | sort -rn | head -40
 
       - name: 上传链接产物 (多图 bin)
         if: success()
