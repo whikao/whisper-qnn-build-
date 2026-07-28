@@ -16,17 +16,21 @@ on:
   workflow_dispatch:
     inputs:
       m1:
-        description: "part1 的 DLC 模型 ID (mn开头)"
-        required: true
+        description: "part1 的 DLC 模型 ID (mn开头, 续跑时留空)"
+        required: false
+        default: ""
       m2:
-        description: "part2 的 DLC 模型 ID"
-        required: true
+        description: "part2 的 DLC 模型 ID (续跑时留空)"
+        required: false
+        default: ""
       m3:
-        description: "part3 的 DLC 模型 ID"
-        required: true
+        description: "part3 的 DLC 模型 ID (续跑时留空)"
+        required: false
+        default: ""
       m4:
-        description: "part4 的 DLC 模型 ID"
-        required: true
+        description: "part4 的 DLC 模型 ID (续跑时留空)"
+        required: false
+        default: ""
       m5:
         description: "part5 (8片时填, 4片留空)"
         required: false
@@ -108,6 +112,7 @@ jobs:
                               "${{ inputs.m5 }}", "${{ inputs.m6 }}",
                               "${{ inputs.m7 }}", "${{ inputs.m8 }}"] if m.strip()]
           print(f"共 {len(mids)} 个 DLC 模型")
+          assert mids, "没填续跑任务 ID, 也没填任何 DLC 模型 ID, 至少填一样"
 
           models = []
           for i, mid in enumerate(mids, 1):
