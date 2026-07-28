@@ -5,9 +5,9 @@
 #   Intermediate Models 里找 job_xxx_dlc 那一行, 复制后面的模型 ID
 #   (mn 开头), 按 part1~4(8) 顺序填入。
 #
-# 产物 artifact:
-#   {component}_linked/      完整包 (stub .onnx + 链接后的 .bin)
-#   {component}_linked_stub  仅 stub (几 KB)
+# 产物 artifact {component}_linked_final:
+#   {component}_linked.bin   链接后的多图 context binary
+#   {component}.onnx         官方 EPContext 规格的多图 stub (串链, 输出 output_0..N)
 # ============================================================================
 
 name: Link compiled parts
@@ -59,6 +59,9 @@ on:
         description: "续跑: 已提交的链接任务 ID (填了就跳过提交直接等它并下载 bin)"
         required: false
         default: ""
+      src_model:
+        description: "仓库里原始(未切片) onnx 路径, 和切片编译时填的一样, 给 stub 提供 shape"
+        required: true
 
 permissions:
   contents: read
@@ -68,6 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -75,7 +79,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install "qai-hub"
+          pip install "qai-hub" "onnx"
 
       - name: 配置 AI Hub API token
         run: |
@@ -159,10 +163,148 @@ jobs:
               if n > 500: break
           PYEOF
 
-      - name: 上传链接产物 (多图 bin)
+      - name: 生成多图 stub onnx (按 onnxruntime 官方 EPContext 规则)
+        env:
+          SRC: ${{ inputs.src_model }}
+          COMP: ${{ inputs.component }}
+        run: |
+          python - <<'PYEOF'
+          import re, glob, os, onnx
+          from onnx import helper, TensorProto
+
+          comp = os.environ["COMP"]
+          bin_path = glob.glob("final/*.bin")[0]
+          bin_name = os.path.basename(bin_path)
+          head = open(bin_path, "rb").read(4 * 1024 * 1024)   # 头部 4MB 足够装元信息
+
+          # ---- 1. 解析 bin 头部: 每张图的 图名 + IO 名 ----
+          # 图名 = graph_xxx, 且其区域内至少有一个 output_N (排除 graph_prune 等假名)
+          pat = re.compile(rb"[ -~]{4,80}")
+          strs = [(m.start(), m.group().decode()) for m in pat.finditer(head)]
+          cand = [(off, s) for off, s in strs if re.fullmatch(r"graph_[A-Za-z0-9_]{6,14}", s)]
+          graphs = []   # [(graph_name, [io names in header order])]
+          for gi, (off, gname) in enumerate(cand):
+              end = cand[gi + 1][0] if gi + 1 < len(cand) else off + 30000
+              io = [s for o, s in strs
+                    if off < o < end and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{2,60}", s)]
+              if any(re.fullmatch(r"output_\d+", s) for s in io):
+                  graphs.append((gname, [s for s in io if s != gname]))
+          assert len(graphs) >= 2, f"只解析到 {len(graphs)} 张图, 检查 bin"
+          print(f"解析到 {len(graphs)} 张图:")
+          for gn, io in graphs:
+              print(f"  {gn}: {len(io)} 个 IO -> {io[:6]}{'...' if len(io)>6 else ''}")
+
+          # ---- 2. 每张图的输入/输出划分: output_N=输出(按数字升序), 其余=输入 ----
+          ginfo = []
+          for gn, io in graphs:
+              outs = sorted({s for s in io if re.fullmatch(r"output_\d+", s)},
+                            key=lambda s: int(s.split("_")[1]))
+              ins = []
+              for s in io:   # 输入按头部出现顺序去重
+                  if s not in outs and s not in ins:
+                      ins.append(s)
+              ginfo.append((gn, ins, outs))
+
+          # ---- 3. 从原始 onnx 取 shape ----
+          src = onnx.load(os.environ["SRC"], load_external_data=False)
+          g = src.graph
+          tab = {}
+          for vi in list(g.input) + list(g.output) + list(g.value_info):
+              tab[vi.name] = vi
+          def shape_of(name):
+              vi = tab.get(name) or tab.get(name.replace("_updated", "")) \
+                   or tab.get(name + "_updated")
+              assert vi is not None, f"原始模型里找不到 {name} 的 shape"
+              t = vi.type.tensor_type
+              dims = [d.dim_value for d in t.shape.dim]
+              assert all(d > 0 for d in dims), f"{name} 含动态维度 {dims}"
+              return t.elem_type, dims
+
+          # ---- 4. 接线: 按输入名匹配 (非首图的输入 = 上一图的输出) ----
+          # 首图 = 输入不是其他图切面名的那张 (取 input 数最多的或含 features/tokens 的)
+          order = []
+          remaining = list(range(len(ginfo)))
+          # 首图: 其输入名在其他图的"输出可改名"集合之外 -> 直接找含全局输入名的
+          src_in_names = {vi.name for vi in g.input}
+          first = None
+          for i in remaining:
+              if any(s in src_in_names for s in ginfo[i][1]):
+                  first = i; break
+          assert first is not None, "找不到首图 (输入名与原始模型输入对不上)"
+          order.append(first); remaining.remove(first)
+          while remaining:
+              prev_outs = set(ginfo[order[-1]][2])
+              nxt = None
+              for i in remaining:
+                  # 该图的输入里若有别名(output_N)之外的长名, 且上一图只有1个输出 -> 串联
+                  long_ins = [s for s in ginfo[i][1] if not re.fullmatch(r"output_\d+", s)]
+                  if len(ginfo[order[-1]][2]) == len(long_ins) == 1 and long_ins:
+                      nxt = i; break
+              assert nxt is not None, "链条接不下去, 需要人工看图"
+              order.append(nxt); remaining.remove(nxt)
+          print("串联顺序:", " -> ".join(ginfo[i][0] for i in order))
+
+          # ---- 5. 造节点: 输入用 bin 里的原名; 输出除末图外改名成下一图的输入名 ----
+          nodes, value_infos, graph_inputs, graph_outputs = [], [], [], []
+          for pos, gi in enumerate(order):
+              gn, ins, outs = ginfo[gi]
+              is_last = (pos == len(order) - 1)
+              # 输入: 首图 -> 原始输入名; 其余 -> 长名 (上一图输出已被改成这个名)
+              node_in_names = ins
+              # 输出: 末图保留 output_N; 其余改成下一图的输入长名
+              if is_last:
+                  node_out_names = outs
+              else:
+                  nxt_ins = [s for s in ginfo[order[pos + 1]][1]
+                             if not re.fullmatch(r"output_\d+", s)]
+                  assert len(nxt_ins) == len(outs) == 1, "中间图只支持单输出串联"
+                  node_out_names = nxt_ins
+              attrs = dict(name=gn, domain="com.microsoft",
+                           source="QnnExecutionProvider",
+                           partition_name=gn,
+                           main_context=1 if pos == 0 else 0)
+              if pos == 0:
+                  attrs.update(ep_cache_context=bin_name, embed_mode=0)
+              node = helper.make_node("EPContext", node_in_names, node_out_names, **attrs)
+              nodes.append(node)
+              # shape 声明
+              for nm in node_in_names:
+                  et, dims = shape_of(nm)
+                  vi = helper.make_tensor_value_info(nm, et, dims)
+                  value_infos.append(vi)
+                  if pos == 0:
+                      graph_inputs.append(vi)
+              for j, nm in enumerate(node_out_names):
+                  if is_last:
+                      et, dims = None, None
+                      # 末图 output_j 的 shape 取原始模型第 j 个输出
+                      sv = g.output[j]
+                      et = sv.type.tensor_type.elem_type
+                      dims = [d.dim_value for d in sv.type.tensor_type.shape.dim]
+                  else:
+                      et, dims = shape_of(nm)
+                  vi = helper.make_tensor_value_info(nm, et, dims)
+                  value_infos.append(vi)
+                  if is_last:
+                      graph_outputs.append(vi)
+
+          gd = helper.make_graph(nodes, f"{comp}_linked", graph_inputs,
+                                 graph_outputs, [], "", value_infos)
+          mo = helper.make_model(gd, producer_name="ms",
+                                 opset_imports=[helper.make_opsetid("", 18),
+                                                helper.make_opsetid("com.microsoft", 1)])
+          out = f"final/{comp}.onnx"
+          onnx.save(mo, out)
+          print("stub 已生成:", out, "%.1f KB" % (os.path.getsize(out) / 1024))
+          for nd in nodes:
+              print(f"  节点 {nd.name}: in={list(nd.input)} out={len(list(nd.output))}个")
+          PYEOF
+          ls -la final/
+
+      - name: 上传链接产物 (多图 bin + stub onnx)
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.component }}_linked_bin
+          name: ${{ inputs.component }}_linked_final
           path: final/
           retention-days: 14
