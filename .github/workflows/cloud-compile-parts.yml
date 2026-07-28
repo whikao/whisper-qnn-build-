@@ -30,13 +30,13 @@ on:
         required: true
         default: encoder
       device_name:
-        description: "AI Hub 设备名"
+        description: "AI Hub 设备名 (family 名, 和 encoder 成功那次一致)"
         required: true
-        default: "Snapdragon 8 Elite Gen 5 QRD"
+        default: "Samsung Galaxy S26 (Family)"
       device_os:
-        description: "设备 OS 版本 (看日志里候选设备的 os 字段, 如 15 / 16)"
-        required: true
-        default: "16"
+        description: "设备 OS 版本 (family 名留空即可)"
+        required: false
+        default: ""
       opt_level:
         description: "HTP 优化档位"
         required: true
@@ -258,19 +258,10 @@ jobs:
           dev, opt, comp = os.environ["DEV"], os.environ["OPT"], os.environ["COMP"]
           devos = os.environ.get("DEVOS", "")
 
-          # 自动解析设备: 按名字拉候选, 不再手工猜 os
-          cands = hub.get_devices(name=dev)
-          assert cands, f"设备 {dev} 不存在"
-          if devos:
-              m = [d for d in cands if str(d.os) == devos]
-              device = m[0] if m else cands[0]
-          else:
-              device = cands[0]
-          if len(cands) > 1:
-              print("候选设备:")
-              for d in cands:
-                  print(f"  name='{d.name}' os='{d.os}' attrs={d.attributes}")
-          print(f"选用设备: name='{device.name}' os='{device.os}'")
+          # family 设备名 (如 Samsung Galaxy S26 (Family)) 由服务器端解析,
+          # 直接传名字即可, 和 encoder 成功那次完全一致; 只有显式给了 os 才带上
+          device = hub.Device(dev, os=devos) if devos else hub.Device(dev)
+          print(f"设备: {device}")
           N = len([x for x in os.environ["CUTS_ENV"].split(",") if x.strip()]) + 1
           options = (f"--target_runtime precompiled_qnn_onnx "
                      f"--qairt_version 2.48 "
