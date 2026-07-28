@@ -240,7 +240,21 @@ jobs:
           assert len(graphs) >= 1, f"一张图都没解析到, 检查 bin"
           print(f"从 {len(bin_paths)} 个 bin 解析到 {len(graphs)} 张图:")
           for gn, io, bf in graphs:
-              print(f"  {gn} ({bf}): {len(io)} 个 IO -> {io[:6]}{'...' if len(io)>6 else ''}")
+              print(f"  {gn} ({bf}): {len(io)} 个 IO -> {io}")
+
+          # ---- 1.5 打印官方单图 stub 的节点 (ground truth 对照) ----
+          for of in sorted(glob.glob("final/*_official.onnx")):
+              om = onnx.load(of)
+              print(f"===== 官方 stub {os.path.basename(of)} =====")
+              for nd in om.graph.node:
+                  attrs = {a.name: (a.s.decode() if a.type == a.STRING else a.i)
+                           for a in nd.attribute}
+                  print(f"  节点 {nd.name} ({nd.op_type})")
+                  print(f"    输入 {list(nd.input)}")
+                  print(f"    输出 {list(nd.output)}")
+                  print(f"    属性 {attrs}")
+              print(f"    图输入 {[v.name for v in om.graph.input]}")
+              print(f"    图输出 {[v.name for v in om.graph.output]}")
 
           # ---- 2. 输入/输出划分 (输入名必须能在原始模型里找到, 过滤乱码) ----
           src = onnx.load(src_path, load_external_data=False)
