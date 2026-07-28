@@ -51,6 +51,10 @@ on:
         description: "AI Hub 设备名 (family 名)"
         required: true
         default: "Samsung Galaxy S26 (Family)"
+      existing_wrap_job:
+        description: "续跑: 已提交的链接任务 ID (填了就跳过提交直接等它并下载 bin)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -58,7 +62,7 @@ permissions:
 jobs:
   link:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -86,6 +90,19 @@ jobs:
 
           dev = os.environ["DEV"]
           comp = os.environ["COMP"]
+          resume = "${{ inputs.existing_wrap_job }}".strip()
+
+          if resume:
+              link = hub.get_job(resume)
+              print(f"续跑模式: 直接等链接任务 {resume}")
+              print("链接状态:", link.wait())
+              ctx = link.get_target_model()
+              assert ctx, "链接失败"
+              os.makedirs("final", exist_ok=True)
+              ctx.download(f"final/{comp}_linked.bin")
+              print("多图 bin 下载完成: %.1f MB" % (os.path.getsize(f"final/{comp}_linked.bin")/1e6))
+              raise SystemExit(0)
+
           mids = [m for m in ["${{ inputs.m1 }}", "${{ inputs.m2 }}",
                               "${{ inputs.m3 }}", "${{ inputs.m4 }}",
                               "${{ inputs.m5 }}", "${{ inputs.m6 }}",
@@ -109,40 +126,25 @@ jobs:
           print("链接状态:", link.wait())
           ctx = link.get_target_model()
           assert ctx, "链接失败, 去 AI Hub 看 job"
-
-          # 包装成 precompiled onnx (stub .onnx + .bin): 不传 options
-          wrap = hub.submit_compile_job(model=ctx, device=device,
-                                        name=f"w8a16-{comp}-linked-wrap")
-          print("包装任务已提交:", wrap.job_id)
-          print("包装状态:", wrap.wait())
-          tm = wrap.get_target_model()
-          assert tm, "包装失败"
+          # 多图 context bin 不能被 AI Hub 包装, 直接下载 bin, stub 自己造
           os.makedirs("final", exist_ok=True)
-          tm.download(f"final/{comp}_linked.zip")
-          print("下载完成")
+          ctx.download(f"final/{comp}_linked.bin")
+          print("多图 bin 下载完成: %.1f MB" % (os.path.getsize(f"final/{comp}_linked.bin")/1e6))
           PYEOF
-          python - <<'PYEOF'
-          import glob, os, zipfile
-          cand = sorted(glob.glob("final/*.zip*"), key=os.path.getmtime)
-          with zipfile.ZipFile(cand[-1]) as z:
-              z.extractall("final/pkg")
-          for f in glob.glob("final/pkg/**/*", recursive=True):
-              if os.path.isfile(f):
-                  print(f, "%.2f MB" % (os.path.getsize(f)/1e6))
-          PYEOF
+          ls -la final/
 
-      - name: 上传完整包
+      - name: 侦察 bin 内的图名/张量名 (给造 stub 用)
+        run: |
+          BIN=$(ls final/*.bin | head -1)
+          echo "===== 疑似图名 (model/graph 字样) ====="
+          strings "$BIN" | grep -iE "graph|part|g[0-9]+" | sort -u | head -30 || true
+          echo "===== 疑似 IO 张量名 ====="
+          strings "$BIN" | grep -E "encoder|decoder|cache|features|output|input" | sort -u | head -40 || true
+
+      - name: 上传链接产物 (多图 bin)
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.component }}_linked
-          path: final/pkg/
-          retention-days: 14
-
-      - name: 单独上传 stub
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.component }}_linked_stub
-          path: final/pkg/*.onnx
+          name: ${{ inputs.component }}_linked_bin
+          path: final/
           retention-days: 14
