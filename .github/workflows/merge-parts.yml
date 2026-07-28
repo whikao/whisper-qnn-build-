@@ -1,0 +1,160 @@
+# ============================================================================
+# 合并 4 个已编译的 part (跳过编译, 直接从 AI Hub 下载产物合并)
+#
+# 背景: cloud-compile-parts 跑完了 4 个分片的云端编译 (全部 SUCCESS),
+#   但解压步骤因文件名 bug 退出, 合并没执行。本 workflow 只做:
+#   按 4 个分片编译任务 ID 下载产物 -> 合并成四分区 EPContext。
+#
+# 输入: p1~p4 的分片编译任务 ID (在上次运行日志 "partX 已提交: j..." 里,
+#       或 AI Hub 网页 jobs 列表找名字 w8a16-encoder-p1-o3 之类的)
+# ============================================================================
+
+name: Merge 4 compiled parts
+
+on:
+  workflow_dispatch:
+    inputs:
+      p1_job:
+        description: "part1 编译任务 ID"
+        required: true
+      p2_job:
+        description: "part2 编译任务 ID"
+        required: true
+      p3_job:
+        description: "part3 编译任务 ID"
+        required: true
+      p4_job:
+        description: "part4 编译任务 ID"
+        required: true
+      component:
+        description: "部件名 encoder/decoder"
+        required: true
+        default: encoder
+
+permissions:
+  contents: read
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "qai-hub" onnx
+
+      - name: 配置 AI Hub API token
+        run: |
+          qai-hub configure --api_token "${{ secrets.QAI_HUB_API_TOKEN }}" || {
+            mkdir -p ~/.qai_hub
+            printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
+          }
+
+      - name: 下载 4 个分片编译产物并解压 (python zipfile, 不挑文件名)
+        env:
+          COMP: ${{ inputs.component }}
+        run: |
+          python - <<'PYEOF'
+          import os, glob, zipfile, qai_hub as hub
+
+          jids = ["${{ inputs.p1_job }}", "${{ inputs.p2_job }}",
+                  "${{ inputs.p3_job }}", "${{ inputs.p4_job }}"]
+          os.makedirs("ctx", exist_ok=True)
+
+          for i, jid in enumerate(jids, 1):
+              job = hub.get_job(jid)
+              st = job.wait()
+              print(f"part{i} ({jid}) 状态: {st}")
+              tm = job.get_target_model()
+              assert tm, f"part{i} 没有产物"
+              dst = f"ctx/part{i}.zip"
+              tm.download(dst)
+              # 文件名可能被 SDK 改, 找实际下载的
+              cand = sorted(glob.glob(f"ctx/part{i}.zip*"), key=os.path.getmtime)
+              real = cand[-1]
+              print(f"  下载为: {real}")
+              outdir = f"ctx/p{i}"
+              os.makedirs(outdir, exist_ok=True)
+              with zipfile.ZipFile(real) as z:
+                  z.extractall(outdir)
+              for f in glob.glob(os.path.join(outdir, "**", "*"), recursive=True):
+                  if os.path.isfile(f):
+                      print(f"  {f}  {os.path.getsize(f)/1e6:.2f}MB")
+          PYEOF
+
+      - name: 合并成四分区 EPContext 模型
+        env:
+          COMP: ${{ inputs.component }}
+        run: |
+          python - <<'PYEOF'
+          import os, glob, shutil, onnx
+          from onnx import helper
+
+          comp = os.environ["COMP"]
+          os.makedirs("final", exist_ok=True)
+
+          nodes_all = []
+          graph_in = None
+          graph_out = None
+          vis = {}
+
+          for i in range(1, 5):
+              d = f"ctx/p{i}"
+              stub = glob.glob(os.path.join(d, "**", "*.onnx"), recursive=True)
+              bins = glob.glob(os.path.join(d, "**", "*.bin"), recursive=True)
+              assert stub and bins, f"part{i} 产物不齐: {stub} {bins}"
+              stub, binf = stub[0], bins[0]
+
+              new_bin = f"{comp}_p{i}.bin"
+              shutil.copy(binf, f"final/{new_bin}")
+              m = onnx.load(stub)
+              old_bin = os.path.basename(binf)
+              renamed = False
+              for node in m.graph.node:
+                  for attr in node.attribute:
+                      if attr.type == attr.STRING:
+                          v = attr.s.decode("utf-8", errors="ignore")
+                          if old_bin in v or v.endswith(".bin"):
+                              attr.s = new_bin.encode()
+                              renamed = True
+                              print(f"part{i}: 节点 {node.name} 引用 {v} -> {new_bin}")
+                  nodes_all.append(node)
+              if not renamed:
+                  print(f"part{i}: 警告: 没找到 .bin 路径属性 (可能是内嵌模式), 合并后需检查")
+
+              init_names = {t.name for t in m.graph.initializer}
+              for vi in m.graph.input:
+                  if vi.name not in init_names:
+                      if i == 1: graph_in = vi
+                      else: vis[vi.name] = vi
+              for vi in m.graph.output:
+                  if i == 4: graph_out = vi
+                  else: vis[vi.name] = vi
+              for vi in m.graph.value_info:
+                  vis[vi.name] = vi
+
+          assert graph_in is not None and graph_out is not None, "首尾输入输出缺失"
+          g = helper.make_graph(nodes_all, f"{comp}_w8a16_4parts",
+                                [graph_in], [graph_out], initializer=[],
+                                value_info=list(vis.values()))
+          mdl = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17),
+                                                    helper.make_opsetid("com.microsoft", 1)])
+          mdl.ir_version = 8
+          onnx.save(mdl, f"final/{comp}_w8a16.onnx")
+          print("合并完成:")
+          for f in sorted(os.listdir("final")):
+              print(" ", f, "%.1f MB" % (os.path.getsize(f"final/{f}")/1e6))
+          PYEOF
+
+      - name: 上传最终产物
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component }}_w8a16_final
+          path: final/
+          retention-days: 14
