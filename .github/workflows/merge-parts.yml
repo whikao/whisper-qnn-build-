@@ -180,10 +180,18 @@ jobs:
               print(" ", f, "%.1f MB" % (os.path.getsize(f"final/{f}")/1e6))
           PYEOF
 
-      - name: 上传最终产物
+      - name: 上传最终产物 (完整: stub + bins)
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.component }}_w8a16_final
           path: final/
+          retention-days: 14
+
+      - name: 单独上传 stub (只有几 KB, bin 没变过时只下这个)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component }}_w8a16_stub_only
+          path: final/*.onnx
           retention-days: 14
