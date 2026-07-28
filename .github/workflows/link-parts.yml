@@ -62,6 +62,10 @@ on:
       src_job:
         description: "AI Hub 量化(QDQ)任务 ID, 和切片编译时下载的完整模型同源 (j开头, 如 jgd2neme5), 给 stub 提供 shape"
         required: true
+      part_jobs:
+        description: "多bin模式: 4个分片编译任务ID(j开头,逗号分隔,顺序随意)。填了就跳过链接,直接下单图bin做多bin stub"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -99,16 +103,17 @@ jobs:
           comp = os.environ["COMP"]
           resume = "${{ inputs.existing_wrap_job }}".strip()
 
-          if resume:
-              link = hub.get_job(resume)
-              print(f"续跑模式: 直接等链接任务 {resume}")
-              print("链接状态:", link.wait())
-              ctx = link.get_target_model()
-              assert ctx, "链接失败"
+          part_jobs = [j.strip() for j in "${{ inputs.part_jobs }}".split(",") if j.strip()]
+          if part_jobs:
               os.makedirs("final", exist_ok=True)
-              ctx.download(f"final/{comp}_linked.bin")
-              print("多图 bin 下载完成: %.1f MB" % (os.path.getsize(f"final/{comp}_linked.bin")/1e6))
+              for i, jid in enumerate(part_jobs, 1):
+                  mdl = hub.get_job(jid).get_target_model()
+                  assert mdl, f"分片任务 {jid} 没有产物"
+                  mdl.download(f"final/{comp}_raw{i}.bin")
+                  print(f"part{i}: {jid} -> %.1f MB" % (os.path.getsize(f"final/{comp}_raw{i}.bin")/1e6))
               raise SystemExit(0)
+
+          if resume:
 
           mids = [m for m in ["${{ inputs.m1 }}", "${{ inputs.m2 }}",
                               "${{ inputs.m3 }}", "${{ inputs.m4 }}",
@@ -189,26 +194,27 @@ jobs:
           src_path = glob.glob("orig/**/*.onnx", recursive=True)[0]
           print("完整 QDQ 模型:", src_path)
 
-          bin_path = glob.glob("final/*.bin")[0]
-          bin_name = os.path.basename(bin_path)
-          head = open(bin_path, "rb").read(4 * 1024 * 1024)   # 头部 4MB 足够装元信息
+          bin_paths = sorted(glob.glob("final/*.bin"))
+          bin_name = os.path.basename(bin_paths[0])
 
-          # ---- 1. 解析 bin 头部: 每张图的 图名 + IO 名 ----
+          # ---- 1. 解析 bin 头部: 每张图的 图名 + IO 名 + 所属 bin ----
           # 图名 = graph_xxx, 且其区域内至少有一个 output_N (排除 graph_prune 等假名)
           pat = re.compile(rb"[ -~]{4,80}")
-          strs = [(m.start(), m.group().decode()) for m in pat.finditer(head)]
-          cand = [(off, s) for off, s in strs if re.fullmatch(r"graph_[A-Za-z0-9_]{6,14}", s)]
-          graphs = []   # [(graph_name, [io names in header order])]
-          for gi, (off, gname) in enumerate(cand):
-              end = cand[gi + 1][0] if gi + 1 < len(cand) else off + 30000
-              io = [s for o, s in strs
-                    if off < o < end and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{2,60}", s)]
-              if any(re.fullmatch(r"output_\d+", s) for s in io):
-                  graphs.append((gname, [s for s in io if s != gname]))
-          assert len(graphs) >= 2, f"只解析到 {len(graphs)} 张图, 检查 bin"
-          print(f"解析到 {len(graphs)} 张图:")
-          for gn, io in graphs:
-              print(f"  {gn}: {len(io)} 个 IO -> {io[:6]}{'...' if len(io)>6 else ''}")
+          graphs = []   # [(graph_name, [io names], bin_file)]
+          for bp in bin_paths:
+              head = open(bp, "rb").read(4 * 1024 * 1024)   # 头部 4MB 足够装元信息
+              strs = [(m.start(), m.group().decode()) for m in pat.finditer(head)]
+              cand = [(off, s) for off, s in strs if re.fullmatch(r"graph_[A-Za-z0-9_]{6,14}", s)]
+              for gi, (off, gname) in enumerate(cand):
+                  end = cand[gi + 1][0] if gi + 1 < len(cand) else off + 30000
+                  io = [s for o, s in strs
+                        if off < o < end and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{2,60}", s)]
+                  if any(re.fullmatch(r"output_\d+", s) for s in io):
+                      graphs.append((gname, [s for s in io if s != gname], os.path.basename(bp)))
+          assert len(graphs) >= 1, f"一张图都没解析到, 检查 bin"
+          print(f"从 {len(bin_paths)} 个 bin 解析到 {len(graphs)} 张图:")
+          for gn, io, bf in graphs:
+              print(f"  {gn} ({bf}): {len(io)} 个 IO -> {io[:6]}{'...' if len(io)>6 else ''}")
 
           # ---- 2. 输入/输出划分 (输入名必须能在原始模型里找到, 过滤乱码) ----
           src = onnx.load(src_path, load_external_data=False)
@@ -230,7 +236,7 @@ jobs:
               return (n in src_names or b in src_names or norm(b) in src_names
                       or norm(n) in src_names)
           ginfo = []
-          for gn, io in graphs:
+          for gn, io, bf in graphs:
               outs = sorted({s for s in io if re.fullmatch(r"output_\d+", s)},
                             key=lambda s: int(s.split("_")[1]))
               ins = []
@@ -239,9 +245,9 @@ jobs:
                       continue
                   if s not in ins:
                       ins.append(s)
-              ginfo.append((gn, ins, outs))
-          for gn, ins, outs in ginfo:
-              print(f"  {gn}: 输入{len(ins)} {ins[:4]}{'...' if len(ins)>4 else ''} 输出{len(outs)}")
+              ginfo.append((gn, ins, outs, bf))
+          for gn, ins, outs, bf in ginfo:
+              print(f"  {gn} [{bf}]: 输入{len(ins)} {ins[:4]}{'...' if len(ins)>4 else ''} 输出{len(outs)}")
 
           # ---- 3. shape 表 ----
           tab = {}
@@ -274,25 +280,41 @@ jobs:
           print("串联顺序:", " -> ".join(ginfo[i][0] for i in order))
 
           # ---- 5. 造节点: 输入用 bin 里的原名; 中间图的唯一输出改成下一图的切面输入名 ----
+          multi_bin = len(bin_paths) > 1
           nodes, value_infos, graph_inputs, graph_outputs = [], [], [], []
           for pos, gi in enumerate(order):
-              gn, ins, outs = ginfo[gi]
+              gn, ins, outs, bf = ginfo[gi]
               is_last = (pos == len(order) - 1)
               node_in_names = ins
               if is_last:
-                  node_out_names = outs
-                  assert len(outs) == len(g.output), \
-                      f"末图输出 {len(outs)} 个 != 原始模型输出 {len(g.output)} 个"
+                  node_out_names = outs   # 末图保留 output_N (中间图的 output_N 已全部改掉, 不撞名)
               else:
                   nxt_cut = cut_names(order[pos + 1])
-                  assert len(nxt_cut) == len(outs) == 1, "中间图只支持单输出串联"
-                  node_out_names = nxt_cut
-              attrs = dict(name=gn, domain="com.microsoft",
-                           source="QnnExecutionProvider",
-                           partition_name=gn,
-                           main_context=1 if pos == 0 else 0)
-              if pos == 0:
-                  attrs.update(ep_cache_context=bin_name, embed_mode=0)
+                  assert len(nxt_cut) == 1, "中间图的下一图应有唯一切面输入"
+                  # 中间图: 第1个输出=切面(改名接通下一图), 其余=cache(用原始模型输出名唯一化)
+                  n_cache = len(outs) - 1
+                  base = len(graph_outputs)   # 已确定的图输出数 = 本图 cache 在原始输出里的起始位
+                  cache_src = []
+                  for j in range(n_cache):
+                      oi = base + j
+                      assert oi < len(g.output), "cache 数超出原始模型输出数"
+                      cache_src.append(g.output[oi])
+                  node_out_names = [nxt_cut[0]] + [sv.name for sv in cache_src]
+              if multi_bin:
+                  # 多 bin 模式: 每个节点都是 main, 各指各的单图 bin (文件名按链位统一为 {comp}_p{N}.bin)
+                  bin_ref = f"{comp}_p{pos + 1}.bin"
+                  attrs = dict(name=gn, domain="com.microsoft",
+                               source="QnnExecutionProvider",
+                               partition_name=gn,
+                               main_context=1,
+                               ep_cache_context=bin_ref, embed_mode=0)
+              else:
+                  attrs = dict(name=gn, domain="com.microsoft",
+                               source="QnnExecutionProvider",
+                               partition_name=gn,
+                               main_context=1 if pos == 0 else 0)
+                  if pos == 0:
+                      attrs.update(ep_cache_context=bin_name, embed_mode=0)
               node = helper.make_node("EPContext", node_in_names, node_out_names, **attrs)
               nodes.append(node)
               # shape 声明
@@ -304,17 +326,31 @@ jobs:
                       graph_inputs.append(vi)
               for j, nm in enumerate(node_out_names):
                   if is_last:
-                      et, dims = None, None
-                      # 末图 output_j 的 shape 取原始模型第 j 个输出
-                      sv = g.output[j]
+                      # 末图第 j 个输出对应原始模型第 len(graph_outputs)+j 个输出
+                      # (中间图的 cache 已按序占了前面; encoder 无中间 cache 时 j 即序号)
+                      sv = g.output[len(graph_outputs)]
                       et = sv.type.tensor_type.elem_type
                       dims = [d.dim_value for d in sv.type.tensor_type.shape.dim]
+                  elif j == 0:
+                      et, dims = shape_of(nm)   # 切面
                   else:
-                      et, dims = shape_of(nm)
+                      sv = cache_src[j - 1]
+                      et = sv.type.tensor_type.elem_type
+                      dims = [d.dim_value for d in sv.type.tensor_type.shape.dim]
                   vi = helper.make_tensor_value_info(nm, et, dims)
                   value_infos.append(vi)
-                  if is_last:
-                      graph_outputs.append(vi)
+                  if is_last or j > 0:
+                      graph_outputs.append(vi)   # 中间图 cache + 末图全部输出 = 图级输出 (切面不进)
+          assert len(graph_outputs) == len(g.output), \
+              f"图输出 {len(graph_outputs)} 个 != 原始模型 {len(g.output)} 个"
+
+          if multi_bin:
+              # bin 按链位改名, 与 stub 里的 ep_cache_context 引用一致
+              for pos, gi in enumerate(order):
+                  bf = ginfo[gi][3]
+                  if bf != f"{comp}_p{pos + 1}.bin":
+                      os.rename(f"final/{bf}", f"final/{comp}_p{pos + 1}.bin")
+                  print(f"链位 p{pos + 1} = {bf} (图 {ginfo[gi][0]})")
 
           gd = helper.make_graph(nodes, f"{comp}_linked", graph_inputs,
                                  graph_outputs, [], "", value_infos)
