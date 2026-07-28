@@ -126,15 +126,23 @@ jobs:
                               renamed = True
                               print(f"part{i}: 节点 {node.name} 引用 {v} -> {new_bin}")
                   nodes_all.append(node)
-              # 节点输出名修复: stub 节点输出是通用名 output_0, 多分区合并会撞名;
-              # 改成该 stub 的 graph 输出名 (真实切面张量名, 链路自动接上)
-              if len(m.graph.node) == 1:
-                  nd = m.graph.node[0]
-                  reals = [vi.name for vi in m.graph.output]
-                  for j in range(len(nd.output)):
-                      if j < len(reals) and nd.output[j] != reals[j]:
-                          print(f"part{i}: 节点输出 {nd.output[j]} -> {reals[j]}")
-                          nd.output[j] = reals[j]
+              # 中间张量撞名修复 (拓扑无关): stub 内部通用名 (output_0 等)
+              # 多分区合并会撞; 真实 graph 输出名必须保留 (切面/最终 IO),
+              # 其余一律加 p{i}_ 前缀, 节点输入引用同步改
+              keep = {vi.name for vi in m.graph.output}
+              rmap = {}
+              for nd in m.graph.node:
+                  for o in nd.output:
+                      if o and o not in keep and not o.startswith(f"p{i}_"):
+                          rmap[o] = f"p{i}_{o}"
+              if rmap:
+                  for nd in m.graph.node:
+                      for j, o in enumerate(nd.output):
+                          if o in rmap: nd.output[j] = rmap[o]
+                      for j, o in enumerate(nd.input):
+                          if o in rmap: nd.input[j] = rmap[o]
+                  print(f"part{i}: 重命名中间张量 {len(rmap)} 个 (如 {list(rmap.items())[0]})")
+              print(f"part{i}: 节点数 {len(m.graph.node)}, 类型 {[n.op_type for n in m.graph.node][:8]}")
               if not renamed:
                   print(f"part{i}: 警告: 没找到 .bin 路径属性 (可能是内嵌模式), 合并后需检查")
 
