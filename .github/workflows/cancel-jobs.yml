@@ -1,0 +1,46 @@
+# 批量取消 AI Hub 任务 (逗号分隔填 ID)
+name: Cancel AI Hub jobs
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_ids:
+        description: "要取消的任务 ID, 逗号分隔 (如 jp81m2zz5,jpxxnv71p)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  cancel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装 qai-hub
+        run: |
+          python -m pip install --upgrade pip
+          pip install "qai-hub"
+      - name: 配置 token
+        run: |
+          qai-hub configure --api_token "${{ secrets.QAI_HUB_API_TOKEN }}" || {
+            mkdir -p ~/.qai_hub
+            printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
+          }
+      - name: 逐个取消
+        run: |
+          python - <<'PYEOF'
+          import qai_hub as hub
+          for jid in "${{ inputs.job_ids }}".split(","):
+              jid = jid.strip()
+              if not jid:
+                  continue
+              try:
+                  job = hub.get_job(jid)
+                  job.cancel()
+                  print(f"{jid}: 已取消")
+              except Exception as e:
+                  print(f"{jid}: {e}")
+          PYEOF
