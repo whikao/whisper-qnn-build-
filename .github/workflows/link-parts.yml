@@ -213,10 +213,17 @@ jobs:
           # ---- 2. 输入/输出划分 (输入名必须能在原始模型里找到, 过滤乱码) ----
           src = onnx.load(src_path, load_external_data=False)
           g = src.graph
-          src_names = {vi.name for vi in list(g.input) + list(g.output) + list(g.value_info)}
-          src_in_names = {vi.name for vi in g.input}
+          # 名字归一化: bin 里的名字 = 原始名去斜杠换下划线, 可能加 _updated 后缀
+          def norm(n):
+              return n.lstrip("/").replace("/", "_")
+          src_names = set()
+          for vi in list(g.input) + list(g.output) + list(g.value_info):
+              src_names.add(vi.name)
+              src_names.add(norm(vi.name))
+          src_in_names = {vi.name for vi in g.input} | {norm(vi.name) for vi in g.input}
           def is_src(n):
-              return n in src_names or n.replace("_updated", "") in src_names
+              b = n.replace("_updated", "")
+              return n in src_names or b in src_names or norm(b) in src_names
           ginfo = []
           for gn, io in graphs:
               outs = sorted({s for s in io if re.fullmatch(r"output_\d+", s)},
@@ -232,10 +239,13 @@ jobs:
               print(f"  {gn}: 输入{len(ins)} {ins[:4]}{'...' if len(ins)>4 else ''} 输出{len(outs)}")
 
           # ---- 3. shape 表 ----
-          tab = {vi.name: vi for vi in list(g.input) + list(g.output) + list(g.value_info)}
+          tab = {}
+          for vi in list(g.input) + list(g.output) + list(g.value_info):
+              tab[vi.name] = vi
+              tab.setdefault(norm(vi.name), vi)
           def shape_of(name):
-              vi = tab.get(name) or tab.get(name.replace("_updated", "")) \
-                   or tab.get(name + "_updated")
+              b = name.replace("_updated", "")
+              vi = tab.get(name) or tab.get(b) or tab.get(norm(b))
               assert vi is not None, f"原始模型里找不到 {name} 的 shape"
               t = vi.type.tensor_type
               dims = [d.dim_value for d in t.shape.dim]
