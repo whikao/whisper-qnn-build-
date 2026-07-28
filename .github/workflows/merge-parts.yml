@@ -180,7 +180,7 @@ jobs:
               print(" ", f, "%.1f MB" % (os.path.getsize(f"final/{f}")/1e6))
           PYEOF
 
-      - name: 上传最终产物 (完整: stub + bins)
+      - name: "上传最终产物 (完整 stub + bins)"
         if: success()
         uses: actions/upload-artifact@v4
         with:
