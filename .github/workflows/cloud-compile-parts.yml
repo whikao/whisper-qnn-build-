@@ -99,7 +99,7 @@ jobs:
         run: |
           python - <<'PYEOF'
           import os, onnx
-          from onnx.utils import extract_model
+          from onnx.utils import Extractor   # 内存友好: 一次加载, 内存内抽取, 不从磁盘反复读
 
           comp = os.environ["COMP"]
           CUTS = [int(x) for x in os.environ["CUTS_ENV"].split(",") if x.strip()]
@@ -190,11 +190,10 @@ jobs:
               segs.append((ins, outs))
               print(f"part{k+1}: 输入 {len(ins)} 个, 输出 {len(outs)} 个")
           os.makedirs("parts", exist_ok=True)
+          extractor = Extractor(model)   # 复用已加载的模型, 不再从磁盘读
           for idx, (ins, outs) in enumerate(segs, 1):
-              tmp = f"parts/{comp}_part{idx}_ext.onnx"
               fin = f"parts/{comp}_part{idx}.onnx"
-              extract_model(src, tmp, ins, outs)
-              m = onnx.load(tmp, load_external_data=True)
+              m = extractor.extract_model(ins, outs)   # 返回新的 ModelProto
               # 修 IR 合法性: 与图输入/输出同名的 value_info 必须删掉,
               # 否则 AI Hub 优化器报 "occur in value_info but also in model IO"
               io_names = {v.name for v in m.graph.input} | {v.name for v in m.graph.output}
@@ -202,10 +201,9 @@ jobs:
               del m.graph.value_info[:]
               m.graph.value_info.extend(keep)
               onnx.save_model(m, fin, save_as_external_data=False)
-              os.remove(tmp)
-              d = os.path.splitext(tmp)[0] + ".data"
-              if os.path.exists(d): os.remove(d)
-              print(f"part{idx}: 节点 {len(m.graph.node)}, {os.path.getsize(fin)/1e6:.1f}MB")
+              nn = len(m.graph.node)
+              del m   # 立即释放本 part 的副本
+              print(f"part{idx}: 节点 {nn}, {os.path.getsize(fin)/1e6:.1f}MB")
           PYEOF
 
       - name: N 路并行提交云端编译, 全部等待
