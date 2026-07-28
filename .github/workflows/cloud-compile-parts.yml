@@ -110,15 +110,25 @@ jobs:
               for f in files:
                   if f == "model.onnx":
                       src = os.path.join(root, f)
+          # 先在不带权重的结构副本上跑 shape inference (带权重的大模型
+          # 直接 infer_shapes 会超 2GB protobuf 限制返回空图),
+          # 再把补出的 value_info (只有类型信息, 很小) 注入带权重的模型
+          model_struct = onnx.load(src, load_external_data=False)
+          model_struct = onnx.shape_inference.infer_shapes(model_struct)
+          vi_extra = {vi.name: vi for vi in model_struct.graph.value_info}
+          print(f"shape inference 完成, 补出 value_info {len(vi_extra)} 条")
+          del model_struct
+
           model = onnx.load(src, load_external_data=True)
-          # decoder 模型内部张量缺 value_info, extract 会报
-          # "names not found in value_infos" —— 先 shape inference 补齐
-          try:
-              model = onnx.shape_inference.infer_shapes(model)
-              print("shape inference 完成, value_info 已补齐")
-          except Exception as e:
-              print("shape inference 部分失败 (可忽略):", str(e)[:200])
           g = model.graph
+          have = {vi.name for vi in g.value_info}
+          added = 0
+          for name, vi in vi_extra.items():
+              if name not in have:
+                  g.value_info.append(vi)
+                  added += 1
+          print(f"注入 value_info {added} 条")
+          del vi_extra
           init_names = {t.name for t in g.initializer}
           print(f"总节点 {len(g.node)}")
 
