@@ -32,7 +32,11 @@ on:
       device_name:
         description: "AI Hub 设备名"
         required: true
-        default: "Snapdragon 8 Elite Gen 5"
+        default: "Snapdragon 8 Elite Gen 5 QRD"
+      device_os:
+        description: "设备 OS 版本 (看日志里候选设备的 os 字段, 如 15 / 16)"
+        required: true
+        default: "16"
       opt_level:
         description: "HTP 优化档位"
         required: true
@@ -71,12 +75,14 @@ jobs:
             printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
           }
 
-      - name: 打印候选设备名 (对照 device_name)
+      - name: 打印候选设备名+OS (对照 device_name/device_os)
         run: |
           python - <<'PYEOF'
           import qai_hub as hub
-          print([d.name for d in hub.get_devices() if "Elite" in d.name])
-          print("你填的是:", "${{ inputs.device_name }}")
+          for d in hub.get_devices():
+              if "Elite" in d.name:
+                  print(f"  name='{d.name}'  os='{d.os}'  attrs={d.attributes}")
+          print("你填的是:", "${{ inputs.device_name }}", "/", "${{ inputs.device_os }}")
           PYEOF
 
       - name: 下载 QDQ 模型
@@ -241,6 +247,7 @@ jobs:
       - name: N 路并行提交云端编译, 全部等待
         env:
           DEV: ${{ inputs.device_name }}
+          DEVOS: ${{ inputs.device_os }}
           OPT: ${{ inputs.opt_level }}
           COMP: ${{ inputs.component }}
           CUTS_ENV: ${{ inputs.cuts }}
@@ -249,6 +256,7 @@ jobs:
           import os, glob, qai_hub as hub
 
           dev, opt, comp = os.environ["DEV"], os.environ["OPT"], os.environ["COMP"]
+          devos = os.environ["DEVOS"]
           N = len([x for x in os.environ["CUTS_ENV"].split(",") if x.strip()]) + 1
           options = (f"--target_runtime precompiled_qnn_onnx "
                      f"--qairt_version 2.48 "
@@ -261,7 +269,7 @@ jobs:
               m = hub.upload_model(p)
               j = hub.submit_compile_job(
                   model=m, name=f"w8a16-{comp}-p{i}-{opt.replace('=','')}",
-                  device=hub.Device(dev), options=options)
+                  device=hub.Device(dev, os=devos), options=options)
               print(f"part{i} 已提交: {j.job_id}")
               jobs.append((i, j))
 
