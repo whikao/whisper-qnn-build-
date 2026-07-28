@@ -59,8 +59,8 @@ on:
         description: "续跑: 已提交的链接任务 ID (填了就跳过提交直接等它并下载 bin)"
         required: false
         default: ""
-      src_model:
-        description: "仓库里原始(未切片) onnx 路径, 和切片编译时填的一样, 给 stub 提供 shape"
+      src_job:
+        description: "AI Hub 量化(QDQ)任务 ID, 和切片编译时下载的完整模型同源 (j开头, 如 jgd2neme5), 给 stub 提供 shape"
         required: true
 
 permissions:
@@ -71,7 +71,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -165,14 +164,29 @@ jobs:
 
       - name: 生成多图 stub onnx (按 onnxruntime 官方 EPContext 规则)
         env:
-          SRC: ${{ inputs.src_model }}
+          SRCJOB: ${{ inputs.src_job }}
           COMP: ${{ inputs.component }}
         run: |
           python - <<'PYEOF'
-          import re, glob, os, onnx
+          import re, glob, os, zipfile, onnx, qai_hub as hub
           from onnx import helper, TensorProto
 
           comp = os.environ["COMP"]
+
+          # ---- 0. 从 AI Hub 下载完整 QDQ 模型 (提供 shape) ----
+          os.makedirs("orig", exist_ok=True)
+          src_job = os.environ["SRCJOB"].strip()
+          mdl = hub.get_job(src_job).get_target_model()
+          assert mdl, f"量化任务 {src_job} 没有产物模型"
+          mdl.download("orig/qdq_model.zip")
+          if zipfile.is_zipfile("orig/qdq_model.zip"):
+              with zipfile.ZipFile("orig/qdq_model.zip") as z:
+                  z.extractall("orig")
+          else:
+              os.rename("orig/qdq_model.zip", "orig/model.onnx")
+          src_path = glob.glob("orig/**/*.onnx", recursive=True)[0]
+          print("完整 QDQ 模型:", src_path)
+
           bin_path = glob.glob("final/*.bin")[0]
           bin_name = os.path.basename(bin_path)
           head = open(bin_path, "rb").read(4 * 1024 * 1024)   # 头部 4MB 足够装元信息
@@ -206,7 +220,7 @@ jobs:
               ginfo.append((gn, ins, outs))
 
           # ---- 3. 从原始 onnx 取 shape ----
-          src = onnx.load(os.environ["SRC"], load_external_data=False)
+          src = onnx.load(src_path, load_external_data=False)
           g = src.graph
           tab = {}
           for vi in list(g.input) + list(g.output) + list(g.value_info):
