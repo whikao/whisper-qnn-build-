@@ -179,11 +179,13 @@ jobs:
           mdl = hub.get_job(src_job).get_target_model()
           assert mdl, f"量化任务 {src_job} 没有产物模型"
           mdl.download("orig/qdq_model.zip")
-          if zipfile.is_zipfile("orig/qdq_model.zip"):
-              with zipfile.ZipFile("orig/qdq_model.zip") as z:
+          dl = glob.glob("orig/qdq_model*")[0]   # download 会自行加后缀
+          print("下载落盘:", dl)
+          if zipfile.is_zipfile(dl):
+              with zipfile.ZipFile(dl) as z:
                   z.extractall("orig")
           else:
-              os.rename("orig/qdq_model.zip", "orig/model.onnx")
+              os.rename(dl, "orig/model.onnx")
           src_path = glob.glob("orig/**/*.onnx", recursive=True)[0]
           print("完整 QDQ 模型:", src_path)
 
@@ -316,7 +318,7 @@ jobs:
           ls -la final/
 
       - name: 上传链接产物 (多图 bin + stub onnx)
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.component }}_linked_final
