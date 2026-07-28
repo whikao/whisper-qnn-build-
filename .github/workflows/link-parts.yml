@@ -212,10 +212,14 @@ jobs:
 
           # ---- 2. 输入/输出划分 (输入名必须能在原始模型里找到, 过滤乱码) ----
           src = onnx.load(src_path, load_external_data=False)
+          if len(src.graph.value_info) < 100:
+              print("原始模型缺 value_info, 跑 shape inference 补齐...")
+              src = onnx.shape_inference.infer_shapes(src)
           g = src.graph
-          # 名字归一化: bin 里的名字 = 原始名去斜杠换下划线, 可能加 _updated 后缀
+          print(f"原始模型 value_info {len(g.value_info)} 条")
+          # 名字归一化: bin 名 = 原始名斜杠直接换下划线 (前导斜杠变前导下划线)
           def norm(n):
-              return n.lstrip("/").replace("/", "_")
+              return n.replace("/", "_")
           src_names = set()
           for vi in list(g.input) + list(g.output) + list(g.value_info):
               src_names.add(vi.name)
@@ -223,7 +227,8 @@ jobs:
           src_in_names = {vi.name for vi in g.input} | {norm(vi.name) for vi in g.input}
           def is_src(n):
               b = n.replace("_updated", "")
-              return n in src_names or b in src_names or norm(b) in src_names
+              return (n in src_names or b in src_names or norm(b) in src_names
+                      or norm(n) in src_names)
           ginfo = []
           for gn, io in graphs:
               outs = sorted({s for s in io if re.fullmatch(r"output_\d+", s)},
