@@ -114,6 +114,15 @@ jobs:
               raise SystemExit(0)
 
           if resume:
+              link = hub.get_job(resume)
+              print(f"续跑模式: 直接等链接任务 {resume}")
+              print("链接状态:", link.wait())
+              ctx = link.get_target_model()
+              assert ctx, "链接失败"
+              os.makedirs("final", exist_ok=True)
+              ctx.download(f"final/{comp}_linked.bin")
+              print("多图 bin 下载完成: %.1f MB" % (os.path.getsize(f"final/{comp}_linked.bin")/1e6))
+              raise SystemExit(0)
 
           mids = [m for m in ["${{ inputs.m1 }}", "${{ inputs.m2 }}",
                               "${{ inputs.m3 }}", "${{ inputs.m4 }}",
