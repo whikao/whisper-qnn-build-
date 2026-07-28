@@ -105,11 +105,28 @@ jobs:
 
           part_jobs = [j.strip() for j in "${{ inputs.part_jobs }}".split(",") if j.strip()]
           if part_jobs:
+              import zipfile, glob
               os.makedirs("final", exist_ok=True)
               for i, jid in enumerate(part_jobs, 1):
                   mdl = hub.get_job(jid).get_target_model()
                   assert mdl, f"分片任务 {jid} 没有产物"
-                  mdl.download(f"final/{comp}_raw{i}.bin")
+                  mdl.download(f"final/raw{i}.zip")
+                  dl = glob.glob(f"final/raw{i}*")[0]   # download 会自行加后缀
+                  if zipfile.is_zipfile(dl):
+                      with zipfile.ZipFile(dl) as z:
+                          names = z.namelist()
+                          print(f"part{i}: {jid} zip 内容: {names}")
+                          z.extractall(f"final/raw{i}")
+                      os.remove(dl)
+                      bins = glob.glob(f"final/raw{i}/**/*.bin", recursive=True)
+                      assert bins, f"part{i} 的 zip 里没找到 bin"
+                      os.rename(bins[0], f"final/{comp}_raw{i}.bin")
+                      # 官方单图 stub 也留着, 供对照
+                      ons = glob.glob(f"final/raw{i}/**/*.onnx", recursive=True)
+                      if ons:
+                          os.rename(ons[0], f"final/{comp}_raw{i}_official.onnx")
+                  else:
+                      os.rename(dl, f"final/{comp}_raw{i}.bin")
                   print(f"part{i}: {jid} -> %.1f MB" % (os.path.getsize(f"final/{comp}_raw{i}.bin")/1e6))
               raise SystemExit(0)
 
