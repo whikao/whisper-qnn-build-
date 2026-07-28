@@ -39,8 +39,24 @@ jobs:
                   continue
               try:
                   job = hub.get_job(jid)
-                  job.cancel()
-                  print(f"{jid}: 已取消")
+                  done = False
+                  for meth in ("cancel", "delete", "abort", "stop"):
+                      fn = getattr(job, meth, None)
+                      if callable(fn):
+                          fn()
+                          print(f"{jid}: 已通过 {meth}() 取消")
+                          done = True
+                          break
+                  if not done:
+                      for meth in ("delete_job", "cancel_job"):
+                          fn = getattr(hub, meth, None)
+                          if callable(fn):
+                              fn(jid)
+                              print(f"{jid}: 已通过 hub.{meth}() 取消")
+                              done = True
+                              break
+                  if not done:
+                      print(f"{jid}: 没有可用的取消接口, 等它 4h 自动超时即可")
               except Exception as e:
                   print(f"{jid}: {e}")
           PYEOF
