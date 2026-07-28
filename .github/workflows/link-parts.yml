@@ -1,34 +1,48 @@
 # ============================================================================
-# 链接 4 个已编译分片 (官方 link job, 替代手工 EPContext 合并)
+# 链接已编译分片 (官方 link job, 用编译任务的中间 DLC 产物)
 #
-# 背景: 手工合并 stub 撞死结 —— bin 里记录的 IO 名是编译时通用名
-#   (output_0), ORT 按名查找, 改名查不到, 不改名 4 个 output_0 撞名。
-#   官方 submit_link_job 把多个 context binary 链接成多图 bin,
-#   再用无 options 的 compile job 包装成 precompiled onnx, IO 映射自动正确。
+# 用法: 打开每个分片编译任务的详情页, 在 Intermediate Assets ->
+#   Intermediate Models 里找 job_xxx_dlc 那一行, 复制后面的模型 ID
+#   (mn 开头), 按 part1~4(8) 顺序填入。
 #
-# 输入: p1~p4 的分片编译任务 ID (已编译完成的那些)
 # 产物 artifact:
 #   {component}_linked/      完整包 (stub .onnx + 链接后的 .bin)
 #   {component}_linked_stub  仅 stub (几 KB)
 # ============================================================================
 
-name: Link 4 compiled parts
+name: Link compiled parts
 
 on:
   workflow_dispatch:
     inputs:
-      p1_job:
-        description: "part1 编译任务 ID"
+      m1:
+        description: "part1 的 DLC 模型 ID (mn开头)"
         required: true
-      p2_job:
-        description: "part2 编译任务 ID"
+      m2:
+        description: "part2 的 DLC 模型 ID"
         required: true
-      p3_job:
-        description: "part3 编译任务 ID"
+      m3:
+        description: "part3 的 DLC 模型 ID"
         required: true
-      p4_job:
-        description: "part4 编译任务 ID"
+      m4:
+        description: "part4 的 DLC 模型 ID"
         required: true
+      m5:
+        description: "part5 (8片时填, 4片留空)"
+        required: false
+        default: ""
+      m6:
+        description: "part6 (可选)"
+        required: false
+        default: ""
+      m7:
+        description: "part7 (可选)"
+        required: false
+        default: ""
+      m8:
+        description: "part8 (可选)"
+        required: false
+        default: ""
       component:
         description: "部件名 encoder/decoder"
         required: true
@@ -62,7 +76,7 @@ jobs:
             printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
           }
 
-      - name: 提交链接任务并等待
+      - name: 提交链接任务, 等待, 包装, 下载
         env:
           DEV: ${{ inputs.device_name }}
           COMP: ${{ inputs.component }}
@@ -72,16 +86,17 @@ jobs:
 
           dev = os.environ["DEV"]
           comp = os.environ["COMP"]
-          jids = ["${{ inputs.p1_job }}", "${{ inputs.p2_job }}",
-                  "${{ inputs.p3_job }}", "${{ inputs.p4_job }}"]
+          mids = [m for m in ["${{ inputs.m1 }}", "${{ inputs.m2 }}",
+                              "${{ inputs.m3 }}", "${{ inputs.m4 }}",
+                              "${{ inputs.m5 }}", "${{ inputs.m6 }}",
+                              "${{ inputs.m7 }}", "${{ inputs.m8 }}"] if m.strip()]
+          print(f"共 {len(mids)} 个 DLC 模型")
 
           models = []
-          for i, jid in enumerate(jids, 1):
-              job = hub.get_job(jid)
-              print(f"part{i} ({jid}) 状态: {job.wait()}")
-              tm = job.get_target_model()
-              assert tm, f"part{i} 无产物"
-              models.append(tm)
+          for i, mid in enumerate(mids, 1):
+              mdl = hub.get_model(mid)
+              print(f"part{i}: {mid} -> {mdl.name}")
+              models.append(mdl)
 
           device = hub.Device(dev)
           try:
@@ -91,8 +106,7 @@ jobs:
               link = hub.submit_link_job(models=models,
                                          name=f"w8a16-{comp}-linked")
           print("链接任务已提交:", link.job_id)
-          st = link.wait()
-          print("链接状态:", st)
+          print("链接状态:", link.wait())
           ctx = link.get_target_model()
           assert ctx, "链接失败, 去 AI Hub 看 job"
 
@@ -100,8 +114,7 @@ jobs:
           wrap = hub.submit_compile_job(model=ctx, device=device,
                                         name=f"w8a16-{comp}-linked-wrap")
           print("包装任务已提交:", wrap.job_id)
-          st = wrap.wait()
-          print("包装状态:", st)
+          print("包装状态:", wrap.wait())
           tm = wrap.get_target_model()
           assert tm, "包装失败"
           os.makedirs("final", exist_ok=True)
