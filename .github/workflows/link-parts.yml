@@ -336,3 +336,11 @@ jobs:
           name: ${{ inputs.component }}_linked_final
           path: final/
           retention-days: 14
+
+      - name: 单独上传 stub onnx (几KB, 已有 bin 时只下这个)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component }}_stub_only
+          path: final/${{ inputs.component }}.onnx
+          retention-days: 14
