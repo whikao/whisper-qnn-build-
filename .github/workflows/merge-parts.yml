@@ -98,12 +98,8 @@ jobs:
           comp = os.environ["COMP"]
           os.makedirs("final", exist_ok=True)
 
-          nodes_all = []
-          graph_ins = []
-          vis = {}
-          later_inputs = []
-          outs_by_part = []
-
+          # ---- 阶段1: 加载全部 stub, 改 bin 引用和节点名 ----
+          stubs = []
           for i in range(1, 5):
               d = f"ctx/p{i}"
               stub = glob.glob(os.path.join(d, "**", "*.onnx"), recursive=True)
@@ -115,62 +111,57 @@ jobs:
               shutil.copy(binf, f"final/{new_bin}")
               m = onnx.load(stub)
               old_bin = os.path.basename(binf)
-              renamed = False
               for node in m.graph.node:
-                  node.name = f"{node.name or 'QNNContext'}_p{i}"   # 节点重名修复: 4 个 stub 的节点同名, 合并后 IR 非法
+                  node.name = f"{node.name or 'QNNContext'}_p{i}"
                   for attr in node.attribute:
                       if attr.type == attr.STRING:
                           v = attr.s.decode("utf-8", errors="ignore")
                           if old_bin in v or v.endswith(".bin"):
                               attr.s = new_bin.encode()
-                              renamed = True
-                              print(f"part{i}: 节点 {node.name} 引用 {v} -> {new_bin}")
-                  nodes_all.append(node)
-              # 中间张量撞名修复 (拓扑无关): stub 内部通用名 (output_0 等)
-              # 多分区合并会撞; 真实 graph 输出名必须保留 (切面/最终 IO),
-              # 其余一律加 p{i}_ 前缀, 节点输入引用同步改
-              keep = {vi.name for vi in m.graph.output}
-              rmap = {}
-              for nd in m.graph.node:
-                  for o in nd.output:
-                      if o and o not in keep and not o.startswith(f"p{i}_"):
-                          rmap[o] = f"p{i}_{o}"
-              if rmap:
-                  for nd in m.graph.node:
-                      for j, o in enumerate(nd.output):
-                          if o in rmap: nd.output[j] = rmap[o]
-                      for j, o in enumerate(nd.input):
-                          if o in rmap: nd.input[j] = rmap[o]
-                  print(f"part{i}: 重命名中间张量 {len(rmap)} 个 (如 {list(rmap.items())[0]})")
               print(f"part{i}: 节点数 {len(m.graph.node)}, 类型 {[n.op_type for n in m.graph.node][:8]}")
-              if not renamed:
-                  print(f"part{i}: 警告: 没找到 .bin 路径属性 (可能是内嵌模式), 合并后需检查")
+              stubs.append(m)
 
-              init_ns = {t.name for t in m.graph.initializer}
-              real_ins = [vi for vi in m.graph.input if vi.name not in init_ns]
-              if i == 1:
-                  graph_ins = real_ins
-              else:
-                  later_inputs.append(real_ins)
-              outs_by_part.append(list(m.graph.output))
-              for vi in m.graph.value_info:
-                  vis[vi.name] = vi
+          # ---- 阶段2: 串联主流 ----
+          # stub 的 graph 输出是通用名 (output_0), 而下一片的输入是真实切面名;
+          # 把第 i 片的主流输出改名为第 i+1 片的切面输入名, 链条才能接上
+          def real_inputs(m):
+            init_ns = {t.name for t in m.graph.initializer}
+            return [vi for vi in m.graph.input if vi.name not in init_ns]
 
+          graph_ins = real_inputs(stubs[0])
           orig_in_names = {v.name for v in graph_ins}
-          cut_names = {vi.name for ins in later_inputs for vi in ins
-                       if vi.name not in orig_in_names}
-          print(f"切面张量 {len(cut_names)} 个: {sorted(cut_names)}")
 
+          cuts = []   # cuts[i] = part(i+2) 的切面输入 ValueInfo (连接 part i+1 -> i+2)
+          for i in range(1, 4):
+              cs = [vi for vi in real_inputs(stubs[i]) if vi.name not in orig_in_names]
+              assert len(cs) == 1, f"part{i+1} 切面输入不是 1 个: {[c.name for c in cs]}"
+              cuts.append(cs[0])
+          print(f"切面张量: {[c.name for c in cuts]}")
+
+          nodes_all = []
           graph_outs = []
-          for outs in outs_by_part:
-              for vi in outs:
-                  if vi.name in cut_names:
-                      vis[vi.name] = vi
+          vis = {}
+          for i, m in enumerate(stubs, 1):
+              # 该 part 的"主流输出" = 名字在多片输出中重复出现(通用名)的那个
+              out_name_cnt = {}
+              for mm in stubs:
+                  for vi in mm.graph.output:
+                      out_name_cnt[vi.name] = out_name_cnt.get(vi.name, 0) + 1
+              for vi in m.graph.output:
+                  if i < 4 and out_name_cnt[vi.name] > 1:
+                      old = vi.name
+                      new = cuts[i - 1].name
+                      vi.name = new                       # graph 输出改名
+                      for nd in m.graph.node:             # 节点输出同步改名
+                          for j, o in enumerate(nd.output):
+                              if o == old: nd.output[j] = new
+                      vis[new] = cuts[i - 1]              # 切面类型信息 (来自下一片输入)
+                      print(f"part{i}: 主流输出 {old} -> {new}")
                   else:
-                      graph_outs.append(vi)
-          for ins in later_inputs:
-              for vi in ins:
-                  if vi.name in cut_names and vi.name not in vis:
+                      graph_outs.append(vi)               # cache 输出/最终输出原样保留
+              nodes_all.extend(m.graph.node)
+              for vi in m.graph.value_info:
+                  if vi.name not in {v.name for v in graph_outs} and vi.name not in vis:
                       vis[vi.name] = vi
 
           assert graph_ins and graph_outs, "首尾输入输出缺失"
