@@ -111,6 +111,13 @@ jobs:
                   if f == "model.onnx":
                       src = os.path.join(root, f)
           model = onnx.load(src, load_external_data=True)
+          # decoder 模型内部张量缺 value_info, extract 会报
+          # "names not found in value_infos" —— 先 shape inference 补齐
+          try:
+              model = onnx.shape_inference.infer_shapes(model)
+              print("shape inference 完成, value_info 已补齐")
+          except Exception as e:
+              print("shape inference 部分失败 (可忽略):", str(e)[:200])
           g = model.graph
           init_names = {t.name for t in g.initializer}
           print(f"总节点 {len(g.node)}")
@@ -154,15 +161,30 @@ jobs:
           assert all(bounds), "切点没找全, 前缀统计见上, 把日志发回来"
 
           # ---- KV cache 兼容: 每个图输出的"生产者层号" ----
-          # cache 输出 (k_cache_*) 是最终输出的一部分, 必须分配到产生它的那一part
-          producer = {}
+          # cache 输出 (k_cache_*) 是最终输出的一部分, 必须分配到产生它的那一part。
+          # 直接生产者常是 QcQuantizeOp_xxx 这种不带层号的节点,
+          # 所以沿生产者链向上回溯, 直到撞见带 /prefix/N/ 的节点。
+          name2node = {}
           for node in g.node:
               for o in node.output:
-                  producer[o] = node.name
+                  name2node[o] = node
 
-          def out_layer(name):
-              pn = producer.get(name, "")
-              mm = re.search(rf"/{re.escape(layer_prefix)}/(\d+)/", pn)
+          layer_re = re.compile(rf"/{re.escape(layer_prefix)}/(\d+)/")
+
+          def out_layer(name, _depth=0):
+              seen = set()
+              stack = [name]
+              while stack:
+                  t = stack.pop()
+                  if t in seen: continue
+                  seen.add(t)
+                  nd = name2node.get(t)
+                  if nd is None: continue
+                  mm = layer_re.search(nd.name)
+                  if mm: return int(mm.group(1))
+                  stack.extend(i for i in nd.input if i)
+              # 回溯也找不到, 试名字里的层号
+              mm = re.search(r"_(?:self|cross)_(\d+)(?:_updated)?$", name)
               if mm: return int(mm.group(1))
               mm = re.search(r"_(\d+)(?:_updated)?$", name)
               if mm: return int(mm.group(1))
