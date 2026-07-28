@@ -1,0 +1,135 @@
+# ============================================================================
+# 链接 4 个已编译分片 (官方 link job, 替代手工 EPContext 合并)
+#
+# 背景: 手工合并 stub 撞死结 —— bin 里记录的 IO 名是编译时通用名
+#   (output_0), ORT 按名查找, 改名查不到, 不改名 4 个 output_0 撞名。
+#   官方 submit_link_job 把多个 context binary 链接成多图 bin,
+#   再用无 options 的 compile job 包装成 precompiled onnx, IO 映射自动正确。
+#
+# 输入: p1~p4 的分片编译任务 ID (已编译完成的那些)
+# 产物 artifact:
+#   {component}_linked/      完整包 (stub .onnx + 链接后的 .bin)
+#   {component}_linked_stub  仅 stub (几 KB)
+# ============================================================================
+
+name: Link 4 compiled parts
+
+on:
+  workflow_dispatch:
+    inputs:
+      p1_job:
+        description: "part1 编译任务 ID"
+        required: true
+      p2_job:
+        description: "part2 编译任务 ID"
+        required: true
+      p3_job:
+        description: "part3 编译任务 ID"
+        required: true
+      p4_job:
+        description: "part4 编译任务 ID"
+        required: true
+      component:
+        description: "部件名 encoder/decoder"
+        required: true
+        default: encoder
+      device_name:
+        description: "AI Hub 设备名 (family 名)"
+        required: true
+        default: "Samsung Galaxy S26 (Family)"
+
+permissions:
+  contents: read
+
+jobs:
+  link:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "qai-hub"
+
+      - name: 配置 AI Hub API token
+        run: |
+          qai-hub configure --api_token "${{ secrets.QAI_HUB_API_TOKEN }}" || {
+            mkdir -p ~/.qai_hub
+            printf '[default]\napi_token=%s\n' "${{ secrets.QAI_HUB_API_TOKEN }}" > ~/.qai_hub/client.ini
+          }
+
+      - name: 提交链接任务并等待
+        env:
+          DEV: ${{ inputs.device_name }}
+          COMP: ${{ inputs.component }}
+        run: |
+          python - <<'PYEOF'
+          import os, qai_hub as hub
+
+          dev = os.environ["DEV"]
+          comp = os.environ["COMP"]
+          jids = ["${{ inputs.p1_job }}", "${{ inputs.p2_job }}",
+                  "${{ inputs.p3_job }}", "${{ inputs.p4_job }}"]
+
+          models = []
+          for i, jid in enumerate(jids, 1):
+              job = hub.get_job(jid)
+              print(f"part{i} ({jid}) 状态: {job.wait()}")
+              tm = job.get_target_model()
+              assert tm, f"part{i} 无产物"
+              models.append(tm)
+
+          device = hub.Device(dev)
+          try:
+              link = hub.submit_link_job(models=models, device=device,
+                                         name=f"w8a16-{comp}-linked")
+          except TypeError:
+              link = hub.submit_link_job(models=models,
+                                         name=f"w8a16-{comp}-linked")
+          print("链接任务已提交:", link.job_id)
+          st = link.wait()
+          print("链接状态:", st)
+          ctx = link.get_target_model()
+          assert ctx, "链接失败, 去 AI Hub 看 job"
+
+          # 包装成 precompiled onnx (stub .onnx + .bin): 不传 options
+          wrap = hub.submit_compile_job(model=ctx, device=device,
+                                        name=f"w8a16-{comp}-linked-wrap")
+          print("包装任务已提交:", wrap.job_id)
+          st = wrap.wait()
+          print("包装状态:", st)
+          tm = wrap.get_target_model()
+          assert tm, "包装失败"
+          os.makedirs("final", exist_ok=True)
+          tm.download(f"final/{comp}_linked.zip")
+          print("下载完成")
+          PYEOF
+          python - <<'PYEOF'
+          import glob, os, zipfile
+          cand = sorted(glob.glob("final/*.zip*"), key=os.path.getmtime)
+          with zipfile.ZipFile(cand[-1]) as z:
+              z.extractall("final/pkg")
+          for f in glob.glob("final/pkg/**/*", recursive=True):
+              if os.path.isfile(f):
+                  print(f, "%.2f MB" % (os.path.getsize(f)/1e6))
+          PYEOF
+
+      - name: 上传完整包
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component }}_linked
+          path: final/pkg/
+          retention-days: 14
+
+      - name: 单独上传 stub
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component }}_linked_stub
+          path: final/pkg/*.onnx
+          retention-days: 14
