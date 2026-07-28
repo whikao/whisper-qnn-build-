@@ -37,6 +37,10 @@ on:
         description: "HTP 优化档位"
         required: true
         default: "O=3"
+      cuts:
+        description: "切片层号, 逗号分隔 (4份: 8,16,24 | 8份: 4,8,12,16,20,24,28)"
+        required: true
+        default: "8,16,24"
 
 permissions:
   contents: read
@@ -88,16 +92,19 @@ jobs:
           PYEOF
           cd orig && unzip -o *.zip && find . -type f | head
 
-      - name: 拆成 4 份 (单文件 onnx)
+      - name: 按输入层号拆成 N 份 (单文件 onnx)
         env:
           COMP: ${{ inputs.component }}
+          CUTS_ENV: ${{ inputs.cuts }}
         run: |
           python - <<'PYEOF'
           import os, onnx
           from onnx.utils import extract_model
 
           comp = os.environ["COMP"]
-          CUTS = [8, 16, 24]
+          CUTS = [int(x) for x in os.environ["CUTS_ENV"].split(",") if x.strip()]
+          N = len(CUTS) + 1
+          print(f"切片层号: {CUTS} -> 共 {N} 份")
           src = None
           for root, _, files in os.walk("orig"):
               for f in files:
@@ -122,8 +129,8 @@ jobs:
           assert all(bounds), "切点没找全"
           in_names  = [i.name for i in g.input]
           out_names = [o.name for o in g.output]
-          segs = [(in_names, [bounds[0]]), ([bounds[0]], [bounds[1]]),
-                  ([bounds[1]], [bounds[2]]), ([bounds[2]], out_names)]
+          pts = [in_names] + [[b] for b in bounds] + [out_names]
+          segs = [(pts[k], pts[k + 1]) for k in range(N)]
 
           os.makedirs("parts", exist_ok=True)
           for idx, (ins, outs) in enumerate(segs, 1):
@@ -144,23 +151,25 @@ jobs:
               print(f"part{idx}: 节点 {len(m.graph.node)}, {os.path.getsize(fin)/1e6:.1f}MB")
           PYEOF
 
-      - name: 4 路并行提交云端编译, 全部等待
+      - name: N 路并行提交云端编译, 全部等待
         env:
           DEV: ${{ inputs.device_name }}
           OPT: ${{ inputs.opt_level }}
           COMP: ${{ inputs.component }}
+          CUTS_ENV: ${{ inputs.cuts }}
         run: |
           python - <<'PYEOF'
-          import os, qai_hub as hub
+          import os, glob, qai_hub as hub
 
           dev, opt, comp = os.environ["DEV"], os.environ["OPT"], os.environ["COMP"]
+          N = len([x for x in os.environ["CUTS_ENV"].split(",") if x.strip()]) + 1
           options = (f"--target_runtime precompiled_qnn_onnx "
                      f"--qairt_version 2.48 "
                      f"--qnn_options default_graph_htp_optimizations={opt}")
           print("编译选项:", options)
 
           jobs = []
-          for i in range(1, 5):
+          for i in range(1, N + 1):
               p = f"parts/{comp}_part{i}.onnx"
               m = hub.upload_model(p)
               j = hub.submit_compile_job(
@@ -178,18 +187,31 @@ jobs:
               tm.download(f"ctx/part{i}.zip")
               print(f"part{i} 产物已下载")
           PYEOF
-          cd ctx && for i in 1 2 3 4; do mkdir -p p$i && (unzip -o part$i.zip -d p$i || tar xf part$i.zip -C p$i); done
-          find ctx -type f | head -30
+          python - <<'PYEOF'
+          import glob, os, zipfile
+          N = len([x for x in os.environ["CUTS_ENV"].split(",") if x.strip()]) + 1
+          for i in range(1, N + 1):
+              cand = sorted(glob.glob(f"ctx/part{i}.zip*"), key=os.path.getmtime)
+              assert cand, f"part{i} 没找到下载文件"
+              os.makedirs(f"ctx/p{i}", exist_ok=True)
+              with zipfile.ZipFile(cand[-1]) as z:
+                  z.extractall(f"ctx/p{i}")
+              print(f"part{i} 解压自 {cand[-1]}")
+          for f in glob.glob("ctx/**/*.onnx", recursive=True) + glob.glob("ctx/**/*.bin", recursive=True):
+              print(f, os.path.getsize(f)/1e6, "MB")
+          PYEOF
 
-      - name: 合并成四分区 EPContext 模型
+      - name: 合并成 N 分区 EPContext 模型
         env:
           COMP: ${{ inputs.component }}
+          CUTS_ENV: ${{ inputs.cuts }}
         run: |
           python - <<'PYEOF'
           import os, glob, shutil, onnx
           from onnx import helper
 
           comp = os.environ["COMP"]
+          N = len([x for x in os.environ["CUTS_ENV"].split(",") if x.strip()]) + 1
           os.makedirs("final", exist_ok=True)
 
           nodes_all = []
@@ -197,7 +219,7 @@ jobs:
           graph_out = None
           vis = {}
 
-          for i in range(1, 5):
+          for i in range(1, N + 1):
               d = f"ctx/p{i}"
               stub = glob.glob(os.path.join(d, "**", "*.onnx"), recursive=True)
               bins = glob.glob(os.path.join(d, "**", "*.bin"), recursive=True)
@@ -225,7 +247,7 @@ jobs:
                       else:
                           vis[vi.name] = vi
               for vi in m.graph.output:
-                  if i == 4:
+                  if i == N:
                       graph_out = vi
                   else:
                       vis[vi.name] = vi
@@ -233,7 +255,7 @@ jobs:
                   vis[vi.name] = vi
 
           assert graph_in is not None and graph_out is not None, "首尾输入输出缺失"
-          g = helper.make_graph(nodes_all, f"{comp}_w8a16_4parts",
+          g = helper.make_graph(nodes_all, f"{comp}_w8a16_{N}parts",
                                 [graph_in], [graph_out], initializer=[],
                                 value_info=list(vis.values()))
           mdl = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17),
