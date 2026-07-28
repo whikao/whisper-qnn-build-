@@ -115,18 +115,36 @@ jobs:
           init_names = {t.name for t in g.initializer}
           print(f"总节点 {len(g.node)}")
 
+          # ---- 自动探测层命名风格: 统计所有 "/前缀/数字/" 模式 ----
+          import re
+          from collections import Counter
+          prefix_cnt = Counter()
+          for node in g.node:
+              mm = re.findall(r"/([A-Za-z_][A-Za-z_0-9]*)/(\d+)/", node.name)
+              for pfx, num in mm:
+                  prefix_cnt[pfx] += 1
+          print("命名前缀统计:", dict(prefix_cnt.most_common(10)))
+
+          # 优先选名字里含部件关键词的前缀 (dec/enc), 否则选出现最多的
+          key = "dec" if "dec" in comp else "enc"
+          cands = [p for p, _ in prefix_cnt.most_common() if key in p.lower()]
+          layer_prefix = cands[0] if cands else prefix_cnt.most_common(1)[0][0]
+          print(f"选用层前缀: /{layer_prefix}/N/")
+
           def find_cut(layer):
-              pat = f"/{comp}/{layer}/"
+              pats = [f"/{layer_prefix}/{layer}/",
+                      f"/{layer_prefix}/layers/{layer}/",
+                      f"/{layer_prefix}/layer/{layer}/"]
               for node in g.node:
-                  if pat in node.name:
+                  if any(p in node.name for p in pats):
                       for inp in node.input:
                           if inp and inp not in init_names:
-                              print(f"  第{layer}层切点 <- {inp}")
+                              print(f"  第{layer}层切点: {node.name} <- {inp}")
                               return inp
               return None
 
           bounds = [find_cut(L) for L in CUTS]
-          assert all(bounds), "切点没找全"
+          assert all(bounds), f"切点没找全, 前缀统计见上, 把日志发回来"
           in_names  = [i.name for i in g.input]
           out_names = [o.name for o in g.output]
           pts = [in_names] + [[b] for b in bounds] + [out_names]
