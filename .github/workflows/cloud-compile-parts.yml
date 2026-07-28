@@ -263,12 +263,17 @@ jobs:
           device = hub.Device(dev, os=devos) if devos else hub.Device(dev)
           print(f"设备: {device}")
           N = len([x for x in os.environ["CUTS_ENV"].split(",") if x.strip()]) + 1
-          options = (f"--target_runtime precompiled_qnn_onnx "
+          # DLC 格式: link job 只接受 QNN DLC 中间产物,
+          # 链接后再用无 options 的 compile job 包装回 precompiled onnx
+          options = (f"--target_runtime qnn_dlc "
                      f"--qairt_version 2.48 "
                      f"--qnn_options default_graph_htp_optimizations={opt}")
           print("编译选项:", options)
 
           jobs = []
+          os.makedirs("ctx", exist_ok=True)
+          with open("ctx/job_ids.txt", "w") as f:
+              pass
           for i in range(1, N + 1):
               p = f"parts/{comp}_part{i}.onnx"
               m = hub.upload_model(p)
@@ -276,121 +281,19 @@ jobs:
                   model=m, name=f"w8a16-{comp}-p{i}-{opt.replace('=','')}",
                   device=device, options=options)
               print(f"part{i} 已提交: {j.job_id}")
+              with open("ctx/job_ids.txt", "a") as f:
+                  f.write(f"part{i}: {j.job_id}\n")
               jobs.append((i, j))
 
-          os.makedirs("ctx", exist_ok=True)
           for i, j in jobs:
               st = j.wait()
               print(f"part{i} 状态: {st}")
               tm = j.get_target_model()
               assert tm, f"part{i} 编译失败, 去 AI Hub 看 job"
-              tm.download(f"ctx/part{i}.zip")
-              print(f"part{i} 产物已下载")
-          PYEOF
-          python - <<'PYEOF'
-          import glob, os, zipfile
-          N = len([x for x in os.environ["CUTS_ENV"].split(",") if x.strip()]) + 1
-          for i in range(1, N + 1):
-              cand = sorted(glob.glob(f"ctx/part{i}.zip*"), key=os.path.getmtime)
-              assert cand, f"part{i} 没找到下载文件"
-              os.makedirs(f"ctx/p{i}", exist_ok=True)
-              with zipfile.ZipFile(cand[-1]) as z:
-                  z.extractall(f"ctx/p{i}")
-              print(f"part{i} 解压自 {cand[-1]}")
-          for f in glob.glob("ctx/**/*.onnx", recursive=True) + glob.glob("ctx/**/*.bin", recursive=True):
-              print(f, os.path.getsize(f)/1e6, "MB")
+          print("全部编译完成, 任务 ID 见 ctx/job_ids.txt")
           PYEOF
 
-      - name: 合并成 N 分区 EPContext 模型
-        env:
-          COMP: ${{ inputs.component }}
-          CUTS_ENV: ${{ inputs.cuts }}
+      - name: 汇总分片编译任务 ID (抄去 Link 4 compiled parts)
         run: |
-          python - <<'PYEOF'
-          import os, glob, shutil, onnx
-          from onnx import helper
-
-          comp = os.environ["COMP"]
-          N = len([x for x in os.environ["CUTS_ENV"].split(",") if x.strip()]) + 1
-          os.makedirs("final", exist_ok=True)
-
-          nodes_all = []
-          graph_ins = []
-          vis = {}
-          later_inputs = []   # part2..N 的输入 (切面 + 原始输入)
-          outs_by_part = []
-
-          for i in range(1, N + 1):
-              d = f"ctx/p{i}"
-              stub = glob.glob(os.path.join(d, "**", "*.onnx"), recursive=True)
-              bins = glob.glob(os.path.join(d, "**", "*.bin"), recursive=True)
-              assert stub and bins, f"part{i} 产物不齐: {stub} {bins}"
-              stub, binf = stub[0], bins[0]
-
-              # bin 重命名为部件专属, 并更新 stub 里的引用
-              new_bin = f"{comp}_p{i}.bin"
-              shutil.copy(binf, f"final/{new_bin}")
-              m = onnx.load(stub)
-              old_bin = os.path.basename(binf)
-              for node in m.graph.node:
-                  for attr in node.attribute:
-                      if attr.type == attr.STRING:
-                          v = attr.s.decode("utf-8", errors="ignore")
-                          if old_bin in v or v.endswith(".bin"):
-                              attr.s = new_bin.encode()
-                              print(f"part{i}: 节点 {node.name} 引用 {v} -> {new_bin}")
-                  nodes_all.append(node)
-
-              init_ns = {t.name for t in m.graph.initializer}
-              real_ins = [vi for vi in m.graph.input if vi.name not in init_ns]
-              if i == 1:
-                  graph_ins = real_ins            # part1 带全部原始输入 (含 cache)
-              else:
-                  later_inputs.append(real_ins)
-              outs_by_part.append(list(m.graph.output))
-              for vi in m.graph.value_info:
-                  vis[vi.name] = vi
-
-          orig_in_names = {v.name for v in graph_ins}
-          # 切面张量 = 后续 part 的输入里, 不属于原始输入的那部分
-          cut_names = {vi.name for ins in later_inputs for vi in ins
-                       if vi.name not in orig_in_names}
-          print(f"切面张量 {len(cut_names)} 个: {sorted(cut_names)}")
-
-          # 最终输出 = 各 part 输出中"不是切面"的; 切面进 value_info
-          graph_outs = []
-          for outs in outs_by_part:
-              for vi in outs:
-                  if vi.name in cut_names:
-                      vis[vi.name] = vi
-                  else:
-                      graph_outs.append(vi)
-          # 后续 part 输入里的原始输入无需处理 (已在 graph_ins); 切面类型信息也从输入侧补一份
-          for ins in later_inputs:
-              for vi in ins:
-                  if vi.name in cut_names and vi.name not in vis:
-                      vis[vi.name] = vi
-
-          assert graph_ins and graph_outs, "首尾输入输出缺失"
-          # 与最终 IO 同名的 value_info 必须剔除, 否则 IR 非法
-          final_io = {v.name for v in graph_ins} | {v.name for v in graph_outs}
-          vis = {k: v for k, v in vis.items() if k not in final_io}
-          g = helper.make_graph(nodes_all, f"{comp}_w8a16_{N}parts",
-                                graph_ins, graph_outs, initializer=[],
-                                value_info=list(vis.values()))
-          mdl = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17),
-                                                    helper.make_opsetid("com.microsoft", 1)])
-          mdl.ir_version = 8
-          onnx.save(mdl, f"final/{comp}_w8a16.onnx")
-          print("合并完成:")
-          for f in sorted(os.listdir("final")):
-              print(" ", f, os.path.getsize(f"final/{f}")/1e6, "MB")
-          PYEOF
-
-      - name: 上传最终产物
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.component }}_w8a16_final
-          path: final/
-          retention-days: 14
+          echo "===== 把下面 4 个 ID 填进 link-parts.yml 的运行表单 ====="
+          cat ctx/job_ids.txt
