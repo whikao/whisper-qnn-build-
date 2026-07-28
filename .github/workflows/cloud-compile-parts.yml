@@ -256,7 +256,21 @@ jobs:
           import os, glob, qai_hub as hub
 
           dev, opt, comp = os.environ["DEV"], os.environ["OPT"], os.environ["COMP"]
-          devos = os.environ["DEVOS"]
+          devos = os.environ.get("DEVOS", "")
+
+          # 自动解析设备: 按名字拉候选, 不再手工猜 os
+          cands = hub.get_devices(name=dev)
+          assert cands, f"设备 {dev} 不存在"
+          if devos:
+              m = [d for d in cands if str(d.os) == devos]
+              device = m[0] if m else cands[0]
+          else:
+              device = cands[0]
+          if len(cands) > 1:
+              print("候选设备:")
+              for d in cands:
+                  print(f"  name='{d.name}' os='{d.os}' attrs={d.attributes}")
+          print(f"选用设备: name='{device.name}' os='{device.os}'")
           N = len([x for x in os.environ["CUTS_ENV"].split(",") if x.strip()]) + 1
           options = (f"--target_runtime precompiled_qnn_onnx "
                      f"--qairt_version 2.48 "
@@ -269,7 +283,7 @@ jobs:
               m = hub.upload_model(p)
               j = hub.submit_compile_job(
                   model=m, name=f"w8a16-{comp}-p{i}-{opt.replace('=','')}",
-                  device=hub.Device(dev, os=devos), options=options)
+                  device=device, options=options)
               print(f"part{i} 已提交: {j.job_id}")
               jobs.append((i, j))
 
