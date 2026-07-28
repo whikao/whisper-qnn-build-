@@ -119,6 +119,12 @@ jobs:
                           if old_bin in v or v.endswith(".bin"):
                               attr.s = new_bin.encode()
               print(f"part{i}: 节点数 {len(m.graph.node)}, 类型 {[n.op_type for n in m.graph.node][:8]}")
+              for nd in m.graph.node:
+                  print(f"part{i}:   节点输入 {list(nd.input)}")
+                  print(f"part{i}:   节点输出 {list(nd.output)}")
+              gi = [vi.name for vi in m.graph.input if vi.name not in {t.name for t in m.graph.initializer}]
+              print(f"part{i}:   图输入 {gi}")
+              print(f"part{i}:   图输出 {[vi.name for vi in m.graph.output]}")
               stubs.append(m)
 
           # ---- 阶段2: 串联主流 ----
