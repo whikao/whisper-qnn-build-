@@ -319,7 +319,29 @@ jobs:
           order = [first] + rest
           print("串联顺序:", " -> ".join(ginfo[i][0] for i in order))
 
-          # ---- 5. 造节点: 输入用 bin 里的原名; 中间图的唯一输出改成下一图的切面输入名 ----
+          # ---- 4.5 给中间图的 bin 改输出名: output_ -> outX___ (同长度字节替换, 解决撞名) ----
+          # 1.29 QNN EP 的 IO 按名匹配: bin 输出名必须出现在节点输出里;
+          # 各图 output_0 重名会撞 ONNX 唯一性, 故把中间图的输出名唯一化
+          for pos, gi in enumerate(order[:-1]):
+              gn, ins, outs, bf = ginfo[gi]
+              letter = chr(ord('A') + pos)
+              path = f"final/{bf}"
+              data = open(path, "rb").read()
+              new_outs = []
+              for o in outs:
+                  new_o = f"out{letter}___" + o.split("_", 1)[1]
+                  assert len(new_o) == len(o)
+                  # 只替换独立出现的原名 (前后不是标识符字符),
+                  # 避免误伤 _encoder_7_Add_1_output_0_updated 这类长名里的子串
+                  pat = rb"(?<![A-Za-z0-9_])" + re.escape(o.encode()) + rb"(?![A-Za-z0-9_])"
+                  data, cnt = re.subn(pat, new_o.encode(), data)
+                  print(f"  链位 p{pos + 1} {bf}: {o} -> {new_o} (替换 {cnt} 处)")
+                  assert cnt > 0, f"{o} 在 {bf} 里一处都没找到"
+                  new_outs.append(new_o)
+              open(path, "wb").write(data)
+              ginfo[gi] = (gn, ins, new_outs, bf)
+
+          # ---- 5. 造节点: 输入输出都用 bin 里的名 (1.29 按名匹配); Identity 桥接通切面 ----
           multi_bin = len(bin_paths) > 1
           nodes, value_infos, graph_inputs, graph_outputs = [], [], [], []
           for pos, gi in enumerate(order):
@@ -327,36 +349,34 @@ jobs:
               is_last = (pos == len(order) - 1)
               node_in_names = ins
               if is_last:
-                  node_out_names = outs   # 末图保留 output_N (中间图的 output_N 已全部改掉, 不撞名)
+                  node_out_names = outs   # 末图保留 output_N (中间图的已唯一化, 不撞名)
               else:
                   nxt_cut = cut_names(order[pos + 1])
                   assert len(nxt_cut) == 1, "中间图的下一图应有唯一切面输入"
-                  # 中间图: 第1个输出=切面(改名接通下一图), 其余=cache(用原始模型输出名唯一化)
+                  # 中间图: 输出用 bin 里的唯一化名; 第1个输出=切面, 经 Identity 桥转成
+                  # 下一图 bin 要求的输入名; 其余=cache, 计入图级输出
                   n_cache = len(outs) - 1
-                  base = len(graph_outputs)   # 已确定的图输出数 = 本图 cache 在原始输出里的起始位
+                  base = len(graph_outputs)
                   cache_src = []
                   for j in range(n_cache):
                       oi = base + j
                       assert oi < len(g.output), "cache 数超出原始模型输出数"
                       cache_src.append(g.output[oi])
-                  node_out_names = [nxt_cut[0]] + [sv.name for sv in cache_src]
-              if multi_bin:
-                  # 多 bin 模式: 每个节点都是 main, 各指各的单图 bin (文件名按链位统一为 {comp}_p{N}.bin)
-                  bin_ref = f"{comp}_p{pos + 1}.bin"
-                  attrs = dict(name=gn, domain="com.microsoft",
-                               source="QnnExecutionProvider",
-                               partition_name=gn,
-                               main_context=1,
-                               ep_cache_context=bin_ref, embed_mode=0)
-              else:
-                  attrs = dict(name=gn, domain="com.microsoft",
-                               source="QnnExecutionProvider",
-                               partition_name=gn,
-                               main_context=1 if pos == 0 else 0)
-                  if pos == 0:
-                      attrs.update(ep_cache_context=bin_name, embed_mode=0)
+                  node_out_names = outs
+              bin_ref = f"{comp}_p{pos + 1}.bin" if multi_bin else bin_name
+              # 属性 1:1 照抄官方单图 stub (source=QNN, 无 partition_name/main_context)
+              attrs = dict(name=f"QNNContext_p{pos + 1}", domain="com.microsoft",
+                           source="QNN",
+                           ep_cache_context=bin_ref, embed_mode=0)
               node = helper.make_node("EPContext", node_in_names, node_out_names, **attrs)
               nodes.append(node)
+              if not is_last:
+                  # Identity 桥: 切面唯一化名 -> 切面原名 (= 下一图 bin 要求的输入名)
+                  et, dims = shape_of(nxt_cut[0])
+                  value_infos.append(helper.make_tensor_value_info(outs[0], et, dims))
+                  value_infos.append(helper.make_tensor_value_info(nxt_cut[0], et, dims))
+                  nodes.append(helper.make_node("Identity", [outs[0]],
+                                                [nxt_cut[0]], name=f"cutbrk_p{pos + 1}"))
               # shape 声明
               for nm in node_in_names:
                   et, dims = shape_of(nm)
@@ -372,7 +392,7 @@ jobs:
                       et = sv.type.tensor_type.elem_type
                       dims = [d.dim_value for d in sv.type.tensor_type.shape.dim]
                   elif j == 0:
-                      et, dims = shape_of(nm)   # 切面
+                      continue   # 切面临时名的 value_info 已在上面桥接处声明
                   else:
                       sv = cache_src[j - 1]
                       et = sv.type.tensor_type.elem_type
