@@ -341,20 +341,45 @@ jobs:
               open(path, "wb").write(data)
               ginfo[gi] = (gn, ins, new_outs, bf)
 
-          # ---- 5. 造节点: 输入输出都用 bin 里的名 (1.29 按名匹配); Identity 桥接通切面 ----
+          # ---- 5. 造节点 ----
+          # 要点:
+          #  a) 1.29 QNN EP 按名匹配: 节点 IO 名 = bin 里记录的名 (中间图输出已唯一化)
+          #  b) w8a16 的 bin 图级 IO 是 float16; 驱动只认 float32 ->
+          #     图级输入 float32 经 Cast 转 fp16 进节点; 节点输出 fp16 经 Cast 转 fp32 出图
+          #  c) 桥接用 Add(x, zero_f16) (恒等且不会被 IdentityElimination 优化掉)
+          F16, F32 = TensorProto.FLOAT16, TensorProto.FLOAT
+          init = [helper.make_tensor("zero_f16", F16, [], [0])]
           multi_bin = len(bin_paths) > 1
           nodes, value_infos, graph_inputs, graph_outputs = [], [], [], []
+          def src_et(name):
+              return shape_of(name)[0]
+          def vi_of(name, et=None):
+              e, dims = shape_of(name)
+              return helper.make_tensor_value_info(name, et or e, dims)
+          # 首图输入的图级包装: 浮点输入 float32 进图 -> Cast 成 fp16 给节点 (int 输入直通)
+          first_ins = ginfo[order[0]][1]
+          cast_in = {}
+          for nm in first_ins:
+              if src_et(nm) == F32:
+                  gn32 = nm + "_f32"
+                  e, dims = shape_of(nm)
+                  graph_inputs.append(helper.make_tensor_value_info(gn32, F32, dims))
+                  value_infos.append(helper.make_tensor_value_info(nm, F16, dims))
+                  nodes.append(helper.make_node("Cast", [gn32], [nm], name="cast_in_" + nm,
+                                                to=int(F16)))
+                  cast_in[nm] = True
+              else:
+                  graph_inputs.append(vi_of(nm))
           for pos, gi in enumerate(order):
               gn, ins, outs, bf = ginfo[gi]
               is_last = (pos == len(order) - 1)
               node_in_names = ins
               if is_last:
                   node_out_names = outs   # 末图保留 output_N (中间图的已唯一化, 不撞名)
+                  cache_src = []
               else:
                   nxt_cut = cut_names(order[pos + 1])
                   assert len(nxt_cut) == 1, "中间图的下一图应有唯一切面输入"
-                  # 中间图: 输出用 bin 里的唯一化名; 第1个输出=切面, 经 Identity 桥转成
-                  # 下一图 bin 要求的输入名; 其余=cache, 计入图级输出
                   n_cache = len(outs) - 1
                   base = len(graph_outputs)
                   cache_src = []
@@ -364,43 +389,43 @@ jobs:
                       cache_src.append(g.output[oi])
                   node_out_names = outs
               bin_ref = f"{comp}_p{pos + 1}.bin" if multi_bin else bin_name
-              # 属性 1:1 照抄官方单图 stub (source=QNN, 无 partition_name/main_context)
               attrs = dict(name=f"QNNContext_p{pos + 1}", domain="com.microsoft",
                            source="QNN",
                            ep_cache_context=bin_ref, embed_mode=0)
               node = helper.make_node("EPContext", node_in_names, node_out_names, **attrs)
               nodes.append(node)
-              if not is_last:
-                  # Identity 桥: 切面唯一化名 -> 切面原名 (= 下一图 bin 要求的输入名)
-                  et, dims = shape_of(nxt_cut[0])
-                  value_infos.append(helper.make_tensor_value_info(outs[0], et, dims))
-                  value_infos.append(helper.make_tensor_value_info(nxt_cut[0], et, dims))
-                  nodes.append(helper.make_node("Identity", [outs[0]],
-                                                [nxt_cut[0]], name=f"cutbrk_p{pos + 1}"))
-              # shape 声明
+              # 输入 shape/dtype 声明 (桥输入在前面已声明的跳过)
               for nm in node_in_names:
-                  et, dims = shape_of(nm)
-                  vi = helper.make_tensor_value_info(nm, et, dims)
-                  value_infos.append(vi)
-                  if pos == 0:
-                      graph_inputs.append(vi)
+                  if nm in cast_in:
+                      continue   # 首图浮点输入已在 cast 处声明 fp16
+                  et = F16 if src_et(nm) == F32 else src_et(nm)
+                  value_infos.append(vi_of(nm, et))
+              # 输出: 桥接 + Cast 包装
               for j, nm in enumerate(node_out_names):
                   if is_last:
-                      # 末图第 j 个输出对应原始模型第 len(graph_outputs)+j 个输出
-                      # (中间图的 cache 已按序占了前面; encoder 无中间 cache 时 j 即序号)
                       sv = g.output[len(graph_outputs)]
-                      et = sv.type.tensor_type.elem_type
                       dims = [d.dim_value for d in sv.type.tensor_type.shape.dim]
-                  elif j == 0:
-                      continue   # 切面临时名的 value_info 已在上面桥接处声明
+                  elif j > 0:
+                      dims = [d.dim_value for d in cache_src[j-1].type.tensor_type.shape.dim]
                   else:
-                      sv = cache_src[j - 1]
-                      et = sv.type.tensor_type.elem_type
-                      dims = [d.dim_value for d in sv.type.tensor_type.shape.dim]
-                  vi = helper.make_tensor_value_info(nm, et, dims)
-                  value_infos.append(vi)
+                      dims = shape_of(nxt_cut[0])[1]
+                  value_infos.append(helper.make_tensor_value_info(nm, F16, dims))
                   if is_last or j > 0:
-                      graph_outputs.append(vi)   # 中间图 cache + 末图全部输出 = 图级输出 (切面不进)
+                      # 图级输出: fp16 -> Cast fp32, 用原始模型输出名, 顺序一致
+                      sv = g.output[len(graph_outputs)]
+                      go_name = sv.name
+                      go_et = sv.type.tensor_type.elem_type
+                      go_dims = [d.dim_value for d in sv.type.tensor_type.shape.dim]
+                      graph_outputs.append(helper.make_tensor_value_info(go_name, go_et, go_dims))
+                      nodes.append(helper.make_node("Cast", [nm], [go_name],
+                                                    name=f"cast_out_{len(graph_outputs)}",
+                                                    to=int(go_et)))
+              if not is_last:
+                  # Add 桥 (恒等, 不会被优化器消除): 切面唯一化名 -> 下一图 bin 要求的输入名
+                  et, dims = shape_of(nxt_cut[0])
+                  value_infos.append(helper.make_tensor_value_info(nxt_cut[0], F16, dims))
+                  nodes.append(helper.make_node("Add", [outs[0], "zero_f16"],
+                                                [nxt_cut[0]], name=f"cutbrk_p{pos + 1}"))
           assert len(graph_outputs) == len(g.output), \
               f"图输出 {len(graph_outputs)} 个 != 原始模型 {len(g.output)} 个"
 
@@ -413,7 +438,7 @@ jobs:
                   print(f"链位 p{pos + 1} = {bf} (图 {ginfo[gi][0]})")
 
           gd = helper.make_graph(nodes, f"{comp}_linked", graph_inputs,
-                                 graph_outputs, [], "", value_infos)
+                                 graph_outputs, init, "", value_infos)
           mo = helper.make_model(gd, producer_name="ms",
                                  opset_imports=[helper.make_opsetid("", 18),
                                                 helper.make_opsetid("com.microsoft", 1)])
